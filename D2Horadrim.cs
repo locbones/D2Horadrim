@@ -90,8 +90,8 @@ namespace D2_Horadrim
 
         private const string RegistryKeyPath = @"Software\D2_Horadrim";
         private const string OriginalIndexColumnName = "__OriginalIndex";
-        /// <summary>GitHub repo for update checks: "owner/repo". Change to your repository.</summary>
-        private const string GitHubReleasesRepo = "USERNAME/D2_Horadrim";
+        /// <summary>GitHub repo for update checks: "owner/repo".</summary>
+        private const string GitHubReleasesRepo = "locbones/D2Horadrim";
         private const int ProgressStreamReaderBufferSize = 1024;
         private const int MaxWorkspacePanelWidth = 260;
         private Image lockImage = Properties.Resources.Locked;
@@ -125,6 +125,7 @@ namespace D2_Horadrim
         private long _loadProgressTotalBytes;
         private int _loadProgressTimerTickCount;
         private int _loadProgressReportCount;
+        private ToolStripMenuItem? _checkForUpdatesItem;
         private readonly HashSet<string> _dirtyFilePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, string> _savedContentByFilePath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Stack<List<(int row, int col, string value)>>> _undoStackByFilePath = new Dictionary<string, Stack<List<(int row, int col, string value)>>>(StringComparer.OrdinalIgnoreCase);
@@ -678,9 +679,9 @@ namespace D2_Horadrim
             var columnMarkersItem = new ToolStripMenuItem("Column &markers");
             columnMarkersItem.Click += (_, _) => MessageBox.Show(ColumnMarkersLegend, "Column markers", MessageBoxButtons.OK, MessageBoxIcon.Information);
             helpToolStripMenuItem.DropDownItems.Add(columnMarkersItem);
-            var checkForUpdatesItem = new ToolStripMenuItem("Check for &updates");
-            checkForUpdatesItem.Click += (_, _) => CheckForUpdatesAsync();
-            helpToolStripMenuItem.DropDownItems.Add(checkForUpdatesItem);
+            _checkForUpdatesItem = new ToolStripMenuItem("Check for &updates");
+            _checkForUpdatesItem.Click += (_, _) => CheckForUpdatesAsync();
+            helpToolStripMenuItem.DropDownItems.Add(_checkForUpdatesItem);
             menuStrip1.Items.Add(helpToolStripMenuItem);
         }
 
@@ -4060,6 +4061,18 @@ namespace D2_Horadrim
                 return;
             }
             string currentVersion = GetCurrentVersion();
+            void SetChecking(bool checking)
+            {
+                this.Invoke(() =>
+                {
+                    if (_checkForUpdatesItem != null)
+                    {
+                        _checkForUpdatesItem.Enabled = !checking;
+                        _checkForUpdatesItem.Text = checking ? "Checking for updates..." : "Check for &updates";
+                    }
+                });
+            }
+            SetChecking(true);
             try
             {
                 using var client = new HttpClient();
@@ -4099,6 +4112,10 @@ namespace D2_Horadrim
             catch (Exception ex)
             {
                 this.Invoke(() => MessageBox.Show($"Update check failed: {ex.Message}", "Check for updates", MessageBoxButtons.OK, MessageBoxIcon.Warning));
+            }
+            finally
+            {
+                SetChecking(false);
             }
         }
 
