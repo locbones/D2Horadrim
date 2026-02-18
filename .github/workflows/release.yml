@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish
+        run: dotnet publish D2_Horadrim.csproj -c Release -o publish
+
+      - name: Create .zip archive
+        run: |
+          $tag = "${{ github.ref_name }}"
+          Compress-Archive -Path publish\* -DestinationPath "D2Horadrim-$tag.zip"
+
+      - name: Create .tar archive
+        run: |
+          $tag = "${{ github.ref_name }}"
+          tar -cvf "D2Horadrim-$tag.tar" -C publish .
+
+      - name: Create .tar.gz archive
+        run: |
+          $tag = "${{ github.ref_name }}"
+          tar -czvf "D2Horadrim-$tag.tar.gz" -C publish .
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            D2Horadrim-${{ github.ref_name }}.zip
+            D2Horadrim-${{ github.ref_name }}.tar
+            D2Horadrim-${{ github.ref_name }}.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

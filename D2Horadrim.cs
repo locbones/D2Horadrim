@@ -12,9 +12,11 @@ using System.Text;
 using System.Text.Json;
 using System.Net.Http;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using static System.Reflection.Metadata.BlobBuilder;
+using System.Data.Common;
 
 namespace D2_Horadrim
 {
@@ -43,6 +45,93 @@ namespace D2_Horadrim
         public List<WorkspaceEntry> Workspaces { get; set; } = new();
     }
 
+    public class PaintTabEventArgs : EventArgs
+    {
+        public required Graphics Graphics { get; init; }
+        public Rectangle Bounds { get; init; }
+        public bool Selected { get; init; }
+        public required TabPage Page { get; init; }
+        public int TabIndex { get; init; }
+    }
+
+    // TabControl with fully flat tabs: UserPaint so we draw the entire tab strip ourselves (no native 3D or borders).
+    public class ThemedTabControl : TabControl
+    {
+        private const int WM_ERASEBKGND = 0x0014;
+        private const int TCM_FIRST = 0x1300;
+        private const int TCM_ADJUSTRECT = TCM_FIRST + 40;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        public Color? TabStripBackColor { get; set; }
+        public event EventHandler<PaintTabEventArgs>? PaintTab;
+
+        public ThemedTabControl()
+        {
+            SetStyle(ControlStyles.UserPaint, true);
+            SetStyle(ControlStyles.AllPaintingInWmPaint, true);
+            SetStyle(ControlStyles.DoubleBuffer, true);
+            SetStyle(ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (TabStripBackColor.HasValue)
+            {
+                using (var brush = new SolidBrush(TabStripBackColor.Value))
+                    e.Graphics.FillRectangle(brush, e.ClipRectangle);
+                return;
+            }
+            base.OnPaintBackground(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            int headerHeight = TabCount > 0 ? GetTabRect(TabCount - 1).Bottom + 2 : 0;
+            Color stripBack = TabStripBackColor ?? BackColor;
+            if (stripBack == Color.Empty || stripBack.A == 0)
+                stripBack = SystemColors.Control;
+            using (var brush = new SolidBrush(stripBack))
+                e.Graphics.FillRectangle(brush, 0, 0, Width, headerHeight);
+            for (int i = 0; i < TabCount; i++)
+            {
+                Rectangle bounds = GetTabRect(i);
+                TabPage page = TabPages[i];
+                bool selected = (SelectedIndex == i);
+                PaintTab?.Invoke(this, new PaintTabEventArgs { Graphics = e.Graphics, Bounds = bounds, Selected = selected, Page = page, TabIndex = i });
+            }
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == TCM_ADJUSTRECT)
+            {
+                RECT rc = Marshal.PtrToStructure<RECT>(m.LParam);
+                rc.Left -= 4;
+                rc.Right += 4;
+                rc.Top -= 2;
+                rc.Bottom += 4;
+                Marshal.StructureToPtr(rc, m.LParam, false);
+            }
+            else if (m.Msg == WM_ERASEBKGND && TabStripBackColor.HasValue)
+            {
+                using (var g = Graphics.FromHdc(m.WParam))
+                using (var brush = new SolidBrush(TabStripBackColor.Value))
+                    g.FillRectangle(brush, ClientRectangle);
+                m.Result = (IntPtr)1;
+                return;
+            }
+            base.WndProc(ref m);
+        }
+    }
+
     public class EditHistoryItem
     {
         public string DisplayText { get; }
@@ -57,15 +146,12 @@ namespace D2_Horadrim
         public string? MathValue { get; }
         public string? MathColumnName { get; }
         public string? MathCellRange { get; }
-        /// <summary>For round operations: "up" or "down".</summary>
+        // For round operations: "up" or "down".
         public string? MathRoundDirection { get; }
-        /// <summary>Math format kind: AddSub, MulDiv, Round, Custom, IncrementFill.</summary>
+        // Math format kind: AddSub, MulDiv, Round, Custom, IncrementFill.
         public string? MathFormatKind { get; }
 
-        public EditHistoryItem(string displayText, string? columnName = null, string? rowName = null, string? oldValue = null, string? newValue = null,
-            string? pasteValue = null, string? pasteCount = null, string? pasteCellRange = null,
-            string? mathOperation = null, string? mathValue = null, string? mathColumnName = null, string? mathCellRange = null,
-            string? mathRoundDirection = null, string? mathFormatKind = null)
+        public EditHistoryItem(string displayText, string? columnName = null, string? rowName = null, string? oldValue = null, string? newValue = null, string? pasteValue = null, string? pasteCount = null, string? pasteCellRange = null, string? mathOperation = null, string? mathValue = null, string? mathColumnName = null, string? mathCellRange = null, string? mathRoundDirection = null, string? mathFormatKind = null)
         {
             DisplayText = displayText;
             ColumnName = columnName;
@@ -84,35 +170,78 @@ namespace D2_Horadrim
         }
     }
 
-    public partial class D2Horadrim : Form
+    public partial class D2Horadrim : Form, IMessageFilter
     {
+        private const int WM_SYSKEYDOWN = 0x0104;
+        private const int WM_SYSKEYUP = 0x0105;
+        private const int VK_MENU = 0x12;
+
+        private const int WH_KEYBOARD_LL = 13;
+        private const int WM_KEYDOWN = 0x0100;
+        private const int WM_KEYUP = 0x0101;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode;
+            public uint scanCode;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        private const uint WM_APP = 0x8000;
+        private const uint WM_HOTKEY_ALT = WM_APP + 1;
+
+        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        private IntPtr _lowLevelHookHandle = IntPtr.Zero;
+        private LowLevelKeyboardProc? _lowLevelHookProc; // keep alive for GC
+        private bool _altKeyLogicalDown; // set when we consume Alt key down so Alt+Click works
+
         private enum MathOp { Add, Subtract, Divide, Multiply, RoundUp, RoundDown, CustomFormula, IncrementFill }
 
         private const string RegistryKeyPath = @"Software\D2_Horadrim";
         private const string OriginalIndexColumnName = "__OriginalIndex";
-        /// <summary>GitHub repo for update checks: "owner/repo".</summary>
+        // GitHub repo for update checks: "owner/repo".
         private const string GitHubReleasesRepo = "locbones/D2Horadrim";
         private const int ProgressStreamReaderBufferSize = 1024;
         private const int MaxWorkspacePanelWidth = 260;
         private Image lockImage = Properties.Resources.Locked;
-        TabControl tabControl = new TabControl();
+        ThemedTabControl tabControl = new ThemedTabControl();
         private Dictionary<string, DataTable> fileCache = new Dictionary<string, DataTable>(StringComparer.OrdinalIgnoreCase);
         private DataGridView? dataGridView;
         private TreeView treeView;
         private string currentFilePath;
         private string lastOpenedDirectory;
+        private string? _startupFileArgument;
+        private string? _startupWorkspaceRole;
+        private string? _startupWorkspaceFolder;
         private HashSet<int> lockedColumns = new HashSet<int>();
         private HashSet<int> lockedRows = new HashSet<int>();
         private int _anchorColumnIndex = -1;
         private int _anchorRowIndex = -1;
-        internal static readonly Color[] DefaultWorkspaceColors = new[]
-        {
-            Color.FromArgb(220, 235, 255),
-            Color.FromArgb(255, 235, 220),
-            Color.FromArgb(220, 255, 235),
-            Color.FromArgb(255, 220, 240),
-            Color.FromArgb(235, 220, 255)
-        };
+        internal static readonly Color[] DefaultWorkspaceColors = new[] { Color.FromArgb(205, 168, 255), Color.FromArgb(253, 176, 253), Color.FromArgb(253, 168, 181), Color.FromArgb(179, 253, 168), Color.FromArgb(248, 253, 147) };
         private static int _nextDefaultColorIndex = 0;
         private Panel? _dropIndicatorPanel;
         private TreeNode? _dropTargetNode;
@@ -120,11 +249,6 @@ namespace D2_Horadrim
         private ProgressBar? _loadProgressBar;
         private Panel? _loadProgressPanel;
         private Label? _loadProgressLabel;
-        private System.Windows.Forms.Timer? _loadProgressTimer;
-        private long _loadProgressBytesRead;
-        private long _loadProgressTotalBytes;
-        private int _loadProgressTimerTickCount;
-        private int _loadProgressReportCount;
         private ToolStripMenuItem? _checkForUpdatesItem;
         private readonly HashSet<string> _dirtyFilePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, string> _savedContentByFilePath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -135,24 +259,43 @@ namespace D2_Horadrim
         private SplitContainer? _workspaceSplitContainer;
         private Panel? _editHistoryPanel;
         private ListBox? _editHistoryListBox;
-        private bool _editHistoryPaneVisible;
+        private bool _editHistoryPaneVisible = true;
         private ToolStripMenuItem? _editHistoryMenuItem;
-        private bool _darkMode;
+        private SplitContainer? _bottomSplitContainer;
+        private Panel? _myNotesPanel;
+        private Label? _myNotesLabel;
+        private TextBox? _myNotesTextBox;
+        private bool _myNotesPaneVisible = true;
+        private ToolStripMenuItem? _myNotesMenuItem;
+        private bool _workspacePaneVisible = true;
+        private ToolStripMenuItem? _workspacePaneMenuItem;
+        private bool _darkMode = true;
         private ToolStripMenuItem? _darkModeMenuItem;
         private ToolStripMenuItem? _adaptiveColumnWidthMenuItem;
         private ToolStripMenuItem? _groupedColumnWidthMenuItem;
         private bool _inGroupedColumnWidthSync;
         private readonly Dictionary<TabPage, int[]> _savedColumnWidthsByTab = new Dictionary<TabPage, int[]>();
         private readonly Dictionary<TabPage, int[]> _savedColumnWidthsBeforeGroupedByTab = new Dictionary<TabPage, int[]>();
+        private ToolStripMenuItem? _groupedRowHeightMenuItem;
+        private bool _inGroupedRowHeightSync;
+        private readonly Dictionary<TabPage, int[]> _savedRowHeightsBeforeGroupedByTab = new Dictionary<TabPage, int[]>();
+        private Dictionary<string, int[]> _savedColumnWidthsByFile = new Dictionary<string, int[]>(StringComparer.OrdinalIgnoreCase);
+        private Dictionary<string, int[]> _savedRowHeightsByFile = new Dictionary<string, int[]>(StringComparer.OrdinalIgnoreCase);
         private bool _autoLoadPreviousSession = true;
+        private bool _preserveD2CompareWorkspaces = false;
         private ToolStripMenuItem? _autoLoadPreviousSessionMenuItem;
+        private ToolStripMenuItem? _preserveD2CompareWorkspacesMenuItem;
         private ToolStripMenuItem? _headerTooltipsFromDataGuideMenuItem;
         private bool _headerTooltipsFromDataGuide;
+        private bool _alwaysLockHeaderColumn;
+        private bool _alwaysLockHeaderRow;
+        private ToolStripMenuItem? _alwaysLockHeaderColumnMenuItem;
+        private ToolStripMenuItem? _alwaysLockHeaderRowMenuItem;
         private Font? _gridFont;
         private bool _createBackupOnSave;
         private int _backupFileCount = 3;
         private int _contextMenuRestoreMode; // 0 none, 1 column, 2 row
-        /// <summary>Manual header tooltips: (fileName -> (columnName -> tooltip text)). Case-insensitive.</summary>
+        // Manual header tooltips: (fileName -> (columnName -> tooltip text)). Case-insensitive.
         private static readonly Dictionary<string, Dictionary<string, string>> ManualHeaderTooltips = BuildManualHeaderTooltips();
         private (int col, string? text)? _lastHeaderTooltipShown;
         private Control? _lastHeaderTooltipControl;
@@ -164,6 +307,7 @@ namespace D2_Horadrim
         private Panel? _workspaceSidePanel;
         private Panel? _workspaceToolbar;
         private Label? _editHistoryLabel;
+        private Panel? _mainPanel;
         private Panel? _searchPanel;
         private TextBox? _searchTextBox;
         private Button? _searchPrevButton;
@@ -189,17 +333,18 @@ namespace D2_Horadrim
         private static readonly Color DarkFore = Color.FromArgb(220, 220, 220);
         private static readonly Color SearchMatchActiveBack = Color.FromArgb(173, 214, 255);
 
-        private Color _gridHeaderColor = SystemColors.Control;
-        private Color _gridFrozenColor = Color.FromArgb(255, 255, 220);
-        private Color _gridEvenRowColor = Color.White;
-        private Color _gridOddRowColor = Color.LightGray;
+        private Color _gridHeaderColor = Color.FromArgb(58, 65, 88);
+        private Color _gridFrozenColor = Color.FromArgb(149, 215, 251);
+        private Color _gridEvenRowColor = Color.FromArgb(44, 44, 44);
+        private Color _gridOddRowColor = Color.FromArgb(62, 62, 62);
         private Color _gridSearchHighlightColor = Color.FromArgb(255, 255, 200);
-        private Color _gridExpansionRowColor = Color.FromArgb(220, 255, 220);
+        private Color _gridExpansionRowColor = Color.FromArgb(138, 0, 21);
         private readonly List<Color> _customPaletteColors = new List<Color>();
 
         private Color _textColorTab = SystemColors.ControlText;
         private Color _textColorHeader = Color.Black;
         private Color _textColorCell = SystemColors.ControlText;
+        private Color _textColorCellFrozen = SystemColors.ControlText;
         private Color _textColorWorkspace = SystemColors.ControlText;
         private Color _textColorEditHistory = SystemColors.ControlText;
         private Color _textColorWorkspaceEntry = SystemColors.ControlText;
@@ -208,12 +353,13 @@ namespace D2_Horadrim
         private Color _textColorMenuActive = SystemColors.HighlightText;
         private Color _textColorButtons = SystemColors.ControlText;
 
-        private Color _textColorTabDark = Color.FromArgb(220, 220, 220);
+        private Color _textColorTabDark = Color.FromArgb(0, 0, 0);
         private Color _textColorHeaderDark = Color.FromArgb(220, 220, 220);
         private Color _textColorCellDark = Color.FromArgb(220, 220, 220);
+        private Color _textColorCellFrozenDark = Color.FromArgb(0, 0, 0);
         private Color _textColorWorkspaceDark = Color.FromArgb(220, 220, 220);
         private Color _textColorEditHistoryDark = Color.FromArgb(220, 220, 220);
-        private Color _textColorWorkspaceEntryDark = Color.FromArgb(220, 220, 220);
+        private Color _textColorWorkspaceEntryDark = Color.FromArgb(0, 0, 0);
         private Color _textColorWorkspaceFilesDark = Color.FromArgb(200, 200, 200);
         private Color _textColorMenuStandbyDark = Color.FromArgb(220, 220, 220);
         private Color _textColorMenuActiveDark = Color.FromArgb(30, 30, 30);
@@ -222,6 +368,7 @@ namespace D2_Horadrim
         private Color TextColorTabActive => _darkMode ? _textColorTabDark : _textColorTab;
         private Color TextColorHeaderActive => _darkMode ? _textColorHeaderDark : _textColorHeader;
         private Color TextColorCellActive => _darkMode ? _textColorCellDark : _textColorCell;
+        private Color TextColorCellFrozenActive => _darkMode ? _textColorCellFrozenDark : _textColorCellFrozen;
         private Color TextColorWorkspaceActive => _darkMode ? _textColorWorkspaceDark : _textColorWorkspace;
         private Color TextColorEditHistoryActive => _darkMode ? _textColorEditHistoryDark : _textColorEditHistory;
         private Color TextColorWorkspaceEntryActive => _darkMode ? _textColorWorkspaceEntryDark : _textColorWorkspaceEntry;
@@ -235,12 +382,13 @@ namespace D2_Horadrim
             InitializeComponent();
 
             treeView = new TreeView();
+            treeView.HideSelection = false; // keep selection visible even when TreeView loses focus
             treeView.NodeMouseDoubleClick += TreeView_NodeMouseDoubleClick;
             treeView.MouseMove += TreeView_MouseMove;
 
             splitContainer1.Dock = DockStyle.Fill;
             splitContainer1.Orientation = Orientation.Vertical;
-            splitContainer1.SplitterDistance = 180;
+            splitContainer1.SplitterDistance = 220;
             splitContainer1.Panel1MinSize = 40;
             splitContainer1.SplitterMoving += (s, e) =>
             {
@@ -301,6 +449,7 @@ namespace D2_Horadrim
             treeView.AllowDrop = true;
             treeView.DrawMode = TreeViewDrawMode.OwnerDrawAll;
             treeView.DrawNode += TreeView_DrawNode;
+            treeView.BeforeLabelEdit += TreeView_BeforeLabelEdit;
             treeView.AfterLabelEdit += TreeView_AfterLabelEdit;
             treeView.ItemDrag += TreeView_ItemDrag;
             treeView.DragOver += TreeView_DragOver;
@@ -357,6 +506,7 @@ namespace D2_Horadrim
 
             splitContainer1.Panel1.Controls.Add(workspaceSidePanel);
 
+            // Workspace context menu (root nodes)
             var workspaceContextMenu = new ContextMenuStrip();
             var renameItem = new ToolStripMenuItem("Rename workspace");
             renameItem.Click += (s, _) =>
@@ -365,17 +515,28 @@ namespace D2_Horadrim
                     treeView.SelectedNode.BeginEdit();
             };
 
-            var removeItem = new ToolStripMenuItem("Remove workspace");
-            removeItem.Click += (s, _) => RemoveSelectedWorkspace();
-
             var setColorItem = new ToolStripMenuItem("Set color...");
             setColorItem.Click += (s, _) => SetWorkspaceColor();
 
             workspaceContextMenu.Items.Add(renameItem);
-            workspaceContextMenu.Items.Add(removeItem);
             workspaceContextMenu.Items.Add(setColorItem);
 
-            treeView.ContextMenuStrip = workspaceContextMenu;
+            // File context menu (workspace file nodes)
+            var fileContextMenu = new ContextMenuStrip();
+            var compareFilesItem = new ToolStripMenuItem("Compare files...");
+            compareFilesItem.Click += (s, _) => CompareWorkspaceFile();
+            fileContextMenu.Items.Add(compareFilesItem);
+
+            // On right-click, set which context menu the tree should show and select the node.
+            // Using the tree's ContextMenuStrip (set here) avoids another menu (e.g. form's) replacing ours on first click.
+            treeView.MouseDown += (s, e) =>
+            {
+                if (e.Button != MouseButtons.Right) return;
+                var node = treeView.GetNodeAt(e.X, e.Y);
+                if (node == null) return;
+                treeView.SelectedNode = node;
+                treeView.ContextMenuStrip = node.Parent == null ? workspaceContextMenu : fileContextMenu;
+            };
 
             tabControl.Dock = DockStyle.Fill;
             tabControl.Appearance = TabAppearance.FlatButtons;
@@ -395,8 +556,8 @@ namespace D2_Horadrim
             };
 
             // Top panel: search bar + tabControl
-            var mainPanel = new Panel { Dock = DockStyle.Fill };
-            mainPanel.Controls.Add(tabControl);
+            _mainPanel = new Panel { Dock = DockStyle.Fill };
+            _mainPanel.Controls.Add(tabControl);
 
             _searchPanel = new Panel { Dock = DockStyle.Top, Height = 64, Padding = new Padding(4, 2, 4, 2) };
             var searchMathTable = new TableLayoutPanel
@@ -406,21 +567,25 @@ namespace D2_Horadrim
                 RowCount = 1,
                 Height = 56
             };
-            searchMathTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 550));
+            searchMathTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 300));
             searchMathTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             searchMathTable.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             var searchContentPanel = new Panel { Dock = DockStyle.Fill, Height = 56 };
             var searchLabel = new Label { Text = "Find:", AutoSize = true, Location = new Point(4, 6) };
-            _searchTextBox = new TextBox { Width = 168, Location = new Point(36, 4), Anchor = AnchorStyles.Left };
+            _searchTextBox = new TextBox { Width = 168, Location = new Point(37, 4), Anchor = AnchorStyles.Left };
             _searchTextBox.TextChanged += SearchTextBox_TextChanged;
             _searchTextBox.KeyDown += SearchTextBox_KeyDown;
+            _searchStatusLabel = new Label { Text = "0 of 0", AutoSize = true, Location = new Point(212, 6) };
+            int searchRow2Y = 30;
+            int searchRow2X = 14;
+            int searchBtnGap = 4;
             _searchMatchCaseCheck = new CheckBox
             {
                 Text = "",
                 Appearance = Appearance.Button,
                 FlatStyle = FlatStyle.Flat,
                 Size = new Size(28, 24),
-                Location = new Point(208, 3),
+                Location = new Point(searchRow2X, searchRow2Y),
                 Checked = false,
                 Font = new Font("Segoe UI", 8.25f, FontStyle.Bold)
             };
@@ -432,7 +597,7 @@ namespace D2_Horadrim
                 Appearance = Appearance.Button,
                 FlatStyle = FlatStyle.Flat,
                 Size = new Size(28, 24),
-                Location = new Point(238, 3),
+                Location = new Point(searchRow2X + 28 + searchBtnGap, searchRow2Y),
                 Checked = false,
                 Font = new Font("Segoe UI", 10f)
             };
@@ -440,39 +605,39 @@ namespace D2_Horadrim
             _searchMatchWholeCellCheck.CheckedChanged += SearchMatchCheck_CheckedChanged;
             toolTip1.SetToolTip(_searchMatchCaseCheck, "Match case");
             toolTip1.SetToolTip(_searchMatchWholeCellCheck, "Match entire cell contents");
-            _searchPrevButton = new Button { Text = "", Size = new Size(70, 24), Location = new Point(270, 3), FlatStyle = FlatStyle.Flat };
+            _searchPrevButton = new Button { Text = "", Size = new Size(70, 24), Location = new Point(searchRow2X + 28 + searchBtnGap + 28 + searchBtnGap, searchRow2Y), FlatStyle = FlatStyle.Flat };
             _searchPrevButton.Tag = "Previous";
             _searchPrevButton.Paint += SearchButton_Paint;
             _searchPrevButton.Click += SearchPrevButton_Click;
-            _searchNextButton = new Button { Text = "", Size = new Size(70, 24), Location = new Point(344, 3), FlatStyle = FlatStyle.Flat };
+            _searchNextButton = new Button { Text = "", Size = new Size(70, 24), Location = new Point(searchRow2X + 28 + searchBtnGap + 28 + searchBtnGap + 70 + searchBtnGap, searchRow2Y), FlatStyle = FlatStyle.Flat };
             _searchNextButton.Tag = "Next";
             _searchNextButton.Paint += SearchButton_Paint;
             _searchNextButton.Click += SearchNextButton_Click;
-            _searchStatusLabel = new Label { Text = "0 of 0", AutoSize = true, Location = new Point(420, 6) };
             searchContentPanel.Controls.Add(searchLabel);
             searchContentPanel.Controls.Add(_searchTextBox);
+            searchContentPanel.Controls.Add(_searchStatusLabel);
             searchContentPanel.Controls.Add(_searchMatchCaseCheck);
             searchContentPanel.Controls.Add(_searchMatchWholeCellCheck);
             searchContentPanel.Controls.Add(_searchPrevButton);
             searchContentPanel.Controls.Add(_searchNextButton);
-            searchContentPanel.Controls.Add(_searchStatusLabel);
             searchMathTable.Controls.Add(searchContentPanel, 0, 0);
 
             _mathPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8, 0, 0, 0) };
             var mathLabel = new Label { Text = "Math:", AutoSize = true, Location = new Point(0, 6) };
-            _mathTextBox = new TextBox { Width = 120, Location = new Point(40, 24), Anchor = AnchorStyles.Left };
+            _mathTextBox = new TextBox { Width = 220, Location = new Point(40, 24), Anchor = AnchorStyles.Left };
             int mathBtnY = 29;
+            int mathBtnX = 4;
             int mathBtnW = 28;
             int mathBtnH = 24;
             int mathGap = 4;
-            _mathAddBtn = CreateMathIconButton("+", "Addition", 0, mathBtnY, mathBtnW, mathBtnH);
-            _mathSubBtn = CreateMathIconButton("−", "Subtraction", mathBtnW + mathGap, mathBtnY, mathBtnW, mathBtnH);
-            _mathDivBtn = CreateMathIconButton("÷", "Division", 2 * (mathBtnW + mathGap), mathBtnY, mathBtnW, mathBtnH);
-            _mathMulBtn = CreateMathIconButton("×", "Multiplication", 3 * (mathBtnW + mathGap), mathBtnY, mathBtnW, mathBtnH);
-            _mathRoundUpBtn = CreateMathIconButton("↑", "Round Up", 4 * (mathBtnW + mathGap), mathBtnY, mathBtnW, mathBtnH);
-            _mathRoundDownBtn = CreateMathIconButton("↓", "Round Down", 5 * (mathBtnW + mathGap), mathBtnY, mathBtnW, mathBtnH);
-            _mathFormulaBtn = CreateMathIconButton("fx", "Custom Formula", 6 * (mathBtnW + mathGap), mathBtnY, 32, mathBtnH);
-            _mathIncrementFillBtn = CreateMathIconButton("1..", "Increment Fill", 6 * (mathBtnW + mathGap) + 36, mathBtnY, mathBtnW, mathBtnH);
+            _mathAddBtn = CreateMathIconButton("+", "Addition", mathBtnX, mathBtnY, mathBtnW, mathBtnH);
+            _mathSubBtn = CreateMathIconButton("−", "Subtraction", mathBtnX + (mathBtnW + mathGap), mathBtnY, mathBtnW, mathBtnH);
+            _mathDivBtn = CreateMathIconButton("÷", "Division", mathBtnX + 2 * (mathBtnW + mathGap), mathBtnY, mathBtnW, mathBtnH);
+            _mathMulBtn = CreateMathIconButton("×", "Multiplication", mathBtnX + 3 * (mathBtnW + mathGap), mathBtnY, mathBtnW, mathBtnH);
+            _mathRoundUpBtn = CreateMathIconButton("↑", "Round Up", mathBtnX + 4 * (mathBtnW + mathGap), mathBtnY, mathBtnW, mathBtnH);
+            _mathRoundDownBtn = CreateMathIconButton("↓", "Round Down", mathBtnX + 5 * (mathBtnW + mathGap), mathBtnY, mathBtnW, mathBtnH);
+            _mathFormulaBtn = CreateMathIconButton("fx", "Custom Formula", mathBtnX + 6 * (mathBtnW + mathGap), mathBtnY, 32, mathBtnH);
+            _mathIncrementFillBtn = CreateMathIconButton("1..", "Increment Fill", mathBtnX + 6 * (mathBtnW + mathGap) + 36, mathBtnY, mathBtnW, mathBtnH);
             _mathAddBtn.Click += (_, _) => ApplyMathOperation(MathOp.Add);
             _mathSubBtn.Click += (_, _) => ApplyMathOperation(MathOp.Subtract);
             _mathDivBtn.Click += (_, _) => ApplyMathOperation(MathOp.Divide);
@@ -501,9 +666,9 @@ namespace D2_Horadrim
             toolTip1.SetToolTip(_mathIncrementFillBtn, "Increment Fill (same column, top to bottom)");
             searchMathTable.Controls.Add(_mathPanel, 1, 0);
             _searchPanel.Controls.Add(searchMathTable);
-            mainPanel.Controls.Add(_searchPanel);
+            _mainPanel.Controls.Add(_searchPanel);
 
-            _workspaceSplitContainer.Panel1.Controls.Add(mainPanel);
+            _workspaceSplitContainer.Panel1.Controls.Add(_mainPanel);
 
             // Bottom panel: Edit History
             _editHistoryPanel = new Panel
@@ -539,23 +704,78 @@ namespace D2_Horadrim
             _editHistoryPanel.Controls.Add(_editHistoryListBox);
             _editHistoryPanel.Controls.Add(editHistoryLabel);
 
-            // Add panel to bottom panel of split container
-            _workspaceSplitContainer.Panel2.Controls.Add(_editHistoryPanel);
+            // Bottom strip: vertical split — left = Edit History, right = My Notes
+            _bottomSplitContainer = new SplitContainer
+            {
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Vertical,
+                Panel1MinSize = 80,
+                Panel2MinSize = 80,
+                SplitterWidth = 4
+            };
+            _bottomSplitContainer.Panel1.Controls.Add(_editHistoryPanel);
+
+            _myNotesPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(4) };
+            _myNotesLabel = new Label
+            {
+                Text = "My Notes",
+                Dock = DockStyle.Top,
+                Height = 22,
+                AutoSize = false,
+                Font = new Font(this.Font.FontFamily, 9F, FontStyle.Bold),
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            _myNotesTextBox = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ScrollBars = ScrollBars.Vertical,
+                Font = new Font(this.Font.FontFamily, 9F),
+                AcceptsReturn = true,
+                WordWrap = true
+            };
+            _myNotesPanel.Controls.Add(_myNotesTextBox);
+            _myNotesPanel.Controls.Add(_myNotesLabel);
+            _bottomSplitContainer.Panel2.Controls.Add(_myNotesPanel);
+
+            _workspaceSplitContainer.Panel2.Controls.Add(_bottomSplitContainer);
+
+            // Initially collapse the bottom strip; My Notes right panel collapsed until toggled
+            _workspaceSplitContainer.Panel2Collapsed = true;
+            _bottomSplitContainer.Panel2Collapsed = true;
 
             // Add split container to Panel2
             splitContainer1.Panel2.Controls.Add(_workspaceSplitContainer);
 
-            // Initially collapse the Edit History panel if desired
-            _workspaceSplitContainer.Panel2Collapsed = true;
-
-            // Adjust SplitterDistance safely after form is loaded
+            // Adjust SplitterDistance safely after form is loaded; load persisted notes
             this.Shown += (s, e) =>
             {
-                // Give 150px to the Edit History panel by default
-                _workspaceSplitContainer.SplitterDistance = splitContainer1.Panel2.Height - 150;
+                int bottomHeight = splitContainer1.Panel2.Height - 150;
+                if (bottomHeight > 0)
+                    _workspaceSplitContainer.SplitterDistance = bottomHeight;
+                if (_bottomSplitContainer != null && _bottomSplitContainer.Width > 0 && !_bottomSplitContainer.Panel1Collapsed && !_bottomSplitContainer.Panel2Collapsed)
+                    _bottomSplitContainer.SplitterDistance = _bottomSplitContainer.Width / 2;
+                LoadMyNotes();
+
+                if (!string.IsNullOrEmpty(_startupFileArgument))
+                {
+                    string path = _startupFileArgument;
+                    string? role = _startupWorkspaceRole;
+                    string? folder = _startupWorkspaceFolder;
+                    _startupFileArgument = null;
+                    _startupWorkspaceRole = null;
+                    _startupWorkspaceFolder = null;
+                    if (File.Exists(path))
+                    {
+                        EnsureStartupWorkspaceForFile(path, role, folder);
+                        var (wsColor, wsFolder) = GetWorkspaceColorForFilePath(path);
+                        LoadFile(path, wsColor, wsFolder);
+                        SelectWorkspaceNodeForFile(path);
+                    }
+                }
             };
 
-            Text = "D2_Horadrim";
+            Text = "D2 Horadrim";
 
             treeView.Dock = DockStyle.Fill;
             SetDoubleBuffered(treeView);
@@ -563,7 +783,7 @@ namespace D2_Horadrim
             tabControl.Height = 30;
             tabControl.DrawMode = TabDrawMode.OwnerDrawFixed;
             tabControl.SizeMode = TabSizeMode.Normal;
-            tabControl.DrawItem += TabControl_DrawItem;
+            tabControl.PaintTab += TabControl_PaintTab;
             tabControl.MouseDown += TabControl_MouseDown;
             tabControl.SelectedIndexChanged += tabControl_SelectedIndexChanged;
 
@@ -587,53 +807,91 @@ namespace D2_Horadrim
             unhideRowsToolStripMenuItem.Click += (s, ev) => RowOptions_Unhide();
             cloneRowsToolStripMenuItem.Click += (s, ev) => RowOptions_Clone();
 
-            _editHistoryMenuItem = new ToolStripMenuItem("Edit &history");
-            _editHistoryMenuItem.CheckOnClick = true;
-            _editHistoryMenuItem.Checked = false;
-            _editHistoryMenuItem.Click += EditHistoryMenuItem_Click;
-            viewToolStripMenuItem.DropDownItems.Add(_editHistoryMenuItem);
-
-            _darkModeMenuItem = new ToolStripMenuItem("&Dark mode");
+            _darkModeMenuItem = new ToolStripMenuItem("Dark mode");
             _darkModeMenuItem.CheckOnClick = true;
-            _darkModeMenuItem.Checked = false;
+            _darkModeMenuItem.Checked = true;
             _darkModeMenuItem.Click += DarkModeMenuItem_Click;
             viewToolStripMenuItem.DropDownItems.Add(_darkModeMenuItem);
 
-            _adaptiveColumnWidthMenuItem = new ToolStripMenuItem("Adaptive &column width");
-            _adaptiveColumnWidthMenuItem.CheckOnClick = true;
-            _adaptiveColumnWidthMenuItem.Checked = false;
-            _adaptiveColumnWidthMenuItem.Click += AdaptiveColumnWidthMenuItem_Click;
-            viewToolStripMenuItem.DropDownItems.Add(_adaptiveColumnWidthMenuItem);
+            _editHistoryMenuItem = new ToolStripMenuItem("Edit History Pane");
+            _editHistoryMenuItem.CheckOnClick = true;
+            _editHistoryMenuItem.Checked = true;
+            _editHistoryMenuItem.Click += EditHistoryMenuItem_Click;
+            viewToolStripMenuItem.DropDownItems.Add(_editHistoryMenuItem);
 
-            _groupedColumnWidthMenuItem = new ToolStripMenuItem("&Grouped column width");
-            _groupedColumnWidthMenuItem.CheckOnClick = true;
-            _groupedColumnWidthMenuItem.Checked = false;
-            _groupedColumnWidthMenuItem.Click += GroupedColumnWidthMenuItem_Click;
-            viewToolStripMenuItem.DropDownItems.Add(_groupedColumnWidthMenuItem);
+            _myNotesMenuItem = new ToolStripMenuItem("My Notes Pane");
+            _myNotesMenuItem.CheckOnClick = true;
+            _myNotesMenuItem.Checked = true;
+            _myNotesMenuItem.Click += MyNotesMenuItem_Click;
+            viewToolStripMenuItem.DropDownItems.Add(_myNotesMenuItem);
 
-            _autoLoadPreviousSessionMenuItem = new ToolStripMenuItem("&Auto-load previous session");
+            _workspacePaneMenuItem = new ToolStripMenuItem("Workspace Pane");
+            _workspacePaneMenuItem.CheckOnClick = true;
+            _workspacePaneMenuItem.Checked = true;
+            _workspacePaneMenuItem.Click += WorkspacePaneMenuItem_Click;
+            viewToolStripMenuItem.DropDownItems.Add(_workspacePaneMenuItem);
+
+            _headerTooltipsFromDataGuideMenuItem = new ToolStripMenuItem("Dataguide Tooltips (Header)");
+            _headerTooltipsFromDataGuideMenuItem.CheckOnClick = true;
+            _headerTooltipsFromDataGuideMenuItem.Checked = false;
+            _headerTooltipsFromDataGuideMenuItem.Click += HeaderTooltipsFromDataGuideMenuItem_Click;
+            viewToolStripMenuItem.DropDownItems.Add(_headerTooltipsFromDataGuideMenuItem);
+
+            _autoLoadPreviousSessionMenuItem = new ToolStripMenuItem("Auto-load previous session");
             _autoLoadPreviousSessionMenuItem.CheckOnClick = true;
             _autoLoadPreviousSessionMenuItem.Checked = true;
             _autoLoadPreviousSessionMenuItem.Click += AutoLoadPreviousSessionMenuItem_Click;
             settingsToolStripMenuItem.DropDownItems.Add(_autoLoadPreviousSessionMenuItem);
 
-            var colorControlsItem = new ToolStripMenuItem("&Background Color Controls...");
+            _preserveD2CompareWorkspacesMenuItem = new ToolStripMenuItem("Preserve D2Compare Workspace");
+            _preserveD2CompareWorkspacesMenuItem.CheckOnClick = true;
+            _preserveD2CompareWorkspacesMenuItem.Checked = false;
+            _preserveD2CompareWorkspacesMenuItem.Click += PreserveD2CompareWorkspacesMenuItem_Click;
+            settingsToolStripMenuItem.DropDownItems.Add(_preserveD2CompareWorkspacesMenuItem);
+
+            _alwaysLockHeaderColumnMenuItem = new ToolStripMenuItem("Always lock/freeze header column");
+            _alwaysLockHeaderColumnMenuItem.CheckOnClick = true;
+            _alwaysLockHeaderColumnMenuItem.Checked = false;
+            _alwaysLockHeaderColumnMenuItem.Click += AlwaysLockHeaderColumnMenuItem_Click;
+            settingsToolStripMenuItem.DropDownItems.Add(_alwaysLockHeaderColumnMenuItem);
+
+            _alwaysLockHeaderRowMenuItem = new ToolStripMenuItem("Always lock/freeze header row");
+            _alwaysLockHeaderRowMenuItem.CheckOnClick = true;
+            _alwaysLockHeaderRowMenuItem.Checked = false;
+            _alwaysLockHeaderRowMenuItem.Click += AlwaysLockHeaderRowMenuItem_Click;
+            settingsToolStripMenuItem.DropDownItems.Add(_alwaysLockHeaderRowMenuItem);
+
+            _adaptiveColumnWidthMenuItem = new ToolStripMenuItem("Adaptive column width");
+            _adaptiveColumnWidthMenuItem.CheckOnClick = true;
+            _adaptiveColumnWidthMenuItem.Checked = false;
+            _adaptiveColumnWidthMenuItem.Click += AdaptiveColumnWidthMenuItem_Click;
+            settingsToolStripMenuItem.DropDownItems.Add(_adaptiveColumnWidthMenuItem);
+
+            _groupedColumnWidthMenuItem = new ToolStripMenuItem("Grouped column width");
+            _groupedColumnWidthMenuItem.CheckOnClick = true;
+            _groupedColumnWidthMenuItem.Checked = false;
+            _groupedColumnWidthMenuItem.Click += GroupedColumnWidthMenuItem_Click;
+            settingsToolStripMenuItem.DropDownItems.Add(_groupedColumnWidthMenuItem);
+
+            _groupedRowHeightMenuItem = new ToolStripMenuItem("Grouped row height");
+            _groupedRowHeightMenuItem.CheckOnClick = true;
+            _groupedRowHeightMenuItem.Checked = false;
+            _groupedRowHeightMenuItem.Click += GroupedRowHeightMenuItem_Click;
+            settingsToolStripMenuItem.DropDownItems.Add(_groupedRowHeightMenuItem);
+
+            var colorControlsItem = new ToolStripMenuItem("Background Color Controls");
             colorControlsItem.Click += ColorControlsMenuItem_Click;
             settingsToolStripMenuItem.DropDownItems.Add(colorControlsItem);
 
-            var textColorControlsItem = new ToolStripMenuItem("&Text Color Controls...");
+            var textColorControlsItem = new ToolStripMenuItem("Text Color Controls");
             textColorControlsItem.Click += TextColorControlsMenuItem_Click;
             settingsToolStripMenuItem.DropDownItems.Add(textColorControlsItem);
 
-            var configurationItem = new ToolStripMenuItem("&Configuration...");
+            var configurationItem = new ToolStripMenuItem("Configuration");
             configurationItem.Click += ConfigurationMenuItem_Click;
             settingsToolStripMenuItem.DropDownItems.Add(configurationItem);
 
-            _headerTooltipsFromDataGuideMenuItem = new ToolStripMenuItem("Header &tooltips");
-            _headerTooltipsFromDataGuideMenuItem.CheckOnClick = true;
-            _headerTooltipsFromDataGuideMenuItem.Checked = false;
-            _headerTooltipsFromDataGuideMenuItem.Click += HeaderTooltipsFromDataGuideMenuItem_Click;
-            settingsToolStripMenuItem.DropDownItems.Add(_headerTooltipsFromDataGuideMenuItem);
+            
 
             _headerTooltipPollTimer = new System.Windows.Forms.Timer(components) { Interval = 150 };
             _headerTooltipPollTimer.Tick += HeaderTooltipPollTimer_Tick;
@@ -676,9 +934,12 @@ namespace D2_Horadrim
             _headerTooltipPanel.BringToFront();
 
             var helpToolStripMenuItem = new ToolStripMenuItem("&Help");
-            var columnMarkersItem = new ToolStripMenuItem("Column &markers");
-            columnMarkersItem.Click += (_, _) => MessageBox.Show(ColumnMarkersLegend, "Column markers", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            helpToolStripMenuItem.DropDownItems.Add(columnMarkersItem);
+            var hotkeysItem = new ToolStripMenuItem("&Hotkeys");
+            hotkeysItem.Click += (_, _) => MessageBox.Show(HotkeysLegend, "Hotkeys", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            helpToolStripMenuItem.DropDownItems.Add(hotkeysItem);
+            var openDataguideItem = new ToolStripMenuItem("Open D2R Dataguide (2.9)");
+            openDataguideItem.Click += (_, _) => OpenD2RDataguide();
+            helpToolStripMenuItem.DropDownItems.Add(openDataguideItem);
             _checkForUpdatesItem = new ToolStripMenuItem("Check for &updates");
             _checkForUpdatesItem.Click += (_, _) => CheckForUpdatesAsync();
             helpToolStripMenuItem.DropDownItems.Add(_checkForUpdatesItem);
@@ -790,6 +1051,16 @@ namespace D2_Horadrim
                 SaveColumnWidthsBeforeGrouped();
             else
                 RestoreSavedColumnWidthsBeforeGrouped();
+            SaveWindowSettings();
+        }
+
+        private void GroupedRowHeightMenuItem_Click(object? sender, EventArgs e)
+        {
+            if (_groupedRowHeightMenuItem?.Checked == true)
+                SaveRowHeightsBeforeGrouped();
+            else
+                RestoreSavedRowHeightsBeforeGrouped();
+            SaveWindowSettings();
         }
 
         private void SaveColumnWidthsBeforeGrouped()
@@ -882,9 +1153,71 @@ namespace D2_Horadrim
             }
         }
 
+        private void SaveRowHeightsBeforeGrouped()
+        {
+            var tab = tabControl.SelectedTab;
+            var dgv = GetCurrentGrid();
+            if (dgv == null || tab == null) return;
+            var heights = new int[dgv.Rows.Count];
+            for (int i = 0; i < dgv.Rows.Count; i++)
+            {
+                if (dgv.Rows[i].IsNewRow) continue;
+                heights[i] = dgv.Rows[i].Height;
+            }
+            _savedRowHeightsBeforeGroupedByTab[tab] = heights;
+        }
+
+        private void RestoreSavedRowHeightsBeforeGrouped()
+        {
+            var tab = tabControl.SelectedTab;
+            var dgv = GetCurrentGrid();
+            if (dgv == null || tab == null) return;
+            if (!_savedRowHeightsBeforeGroupedByTab.TryGetValue(tab, out int[]? heights)) return;
+            _inGroupedRowHeightSync = true;
+            try
+            {
+                for (int i = 0; i < dgv.Rows.Count && i < heights.Length; i++)
+                {
+                    if (dgv.Rows[i].IsNewRow) continue;
+                    dgv.Rows[i].Height = heights[i];
+                }
+            }
+            finally
+            {
+                _inGroupedRowHeightSync = false;
+            }
+        }
+
+        private void DataGridView_RowHeightChanged(object? sender, DataGridViewRowEventArgs e)
+        {
+            if (_groupedRowHeightMenuItem?.Checked != true || _inGroupedRowHeightSync) return;
+            var dgv = sender as DataGridView;
+            if (dgv == null || e.Row == null || e.Row.IsNewRow) return;
+            int h = e.Row.Height;
+            _inGroupedRowHeightSync = true;
+            try
+            {
+                for (int i = 0; i < dgv.Rows.Count; i++)
+                {
+                    if (dgv.Rows[i].IsNewRow) continue;
+                    dgv.Rows[i].Height = h;
+                }
+            }
+            finally
+            {
+                _inGroupedRowHeightSync = false;
+            }
+        }
+
         private void AutoLoadPreviousSessionMenuItem_Click(object? sender, EventArgs e)
         {
             _autoLoadPreviousSession = _autoLoadPreviousSessionMenuItem?.Checked ?? true;
+            SaveWindowSettings();
+        }
+
+        private void PreserveD2CompareWorkspacesMenuItem_Click(object? sender, EventArgs e)
+        {
+            _preserveD2CompareWorkspaces = _preserveD2CompareWorkspacesMenuItem?.Checked ?? false;
             SaveWindowSettings();
         }
 
@@ -915,9 +1248,7 @@ namespace D2_Horadrim
                     if (dgv.Columns[c].Name == OriginalIndexColumnName) continue;
                     if (dgv.Columns[c].Visible == false) continue;
                     var val = dgv.Rows[r].Cells[c].Value?.ToString() ?? "";
-                    bool isMatch = matchWholeCell
-                        ? string.Equals(val, term, comparison)
-                        : val.Contains(term, comparison);
+                    bool isMatch = matchWholeCell ? string.Equals(val, term, comparison) : val.Contains(term, comparison);
                     if (isMatch)
                         _searchMatches.Add((r, c));
                 }
@@ -1043,7 +1374,10 @@ namespace D2_Horadrim
                 _workspaceSplitContainer.Panel1.BackColor = panelBack;
                 _workspaceSplitContainer.Panel2.BackColor = panelBack;
             }
+            if (_mainPanel != null)
+                _mainPanel.BackColor = panelBack;
             tabControl.BackColor = panelBack;
+            tabControl.TabStripBackColor = panelBack;
             if (_searchPanel != null)
             {
                 _searchPanel.BackColor = panelBack;
@@ -1076,6 +1410,17 @@ namespace D2_Horadrim
                 _editHistoryLabel.BackColor = panelBack;
                 _editHistoryLabel.ForeColor = fore;
             }
+            if (_myNotesPanel != null)
+            {
+                _myNotesPanel.BackColor = panelBack;
+                foreach (Control c in _myNotesPanel.Controls)
+                {
+                    c.BackColor = panelBack;
+                    c.ForeColor = fore;
+                }
+            }
+            if (_myNotesTextBox != null) { _myNotesTextBox.BackColor = back; _myNotesTextBox.ForeColor = fore; }
+            if (_myNotesLabel != null) { _myNotesLabel.BackColor = panelBack; _myNotesLabel.ForeColor = fore; }
 
             if (_loadProgressPanel != null)
             {
@@ -1157,6 +1502,10 @@ namespace D2_Horadrim
                 _editHistoryListBox.ForeColor = ehColor;
             if (_editHistoryLabel != null)
                 _editHistoryLabel.ForeColor = ehColor;
+            if (_myNotesTextBox != null)
+                _myNotesTextBox.ForeColor = ehColor;
+            if (_myNotesLabel != null)
+                _myNotesLabel.ForeColor = ehColor;
 
             menuStrip1.ForeColor = menuStandby;
             foreach (ToolStripItem item in menuStrip1.Items)
@@ -1188,15 +1537,42 @@ namespace D2_Horadrim
         private void EditHistoryMenuItem_Click(object? sender, EventArgs e)
         {
             _editHistoryPaneVisible = _editHistoryMenuItem?.Checked ?? false;
-            if (_workspaceSplitContainer == null) return;
-            _workspaceSplitContainer.Panel2Collapsed = !_editHistoryPaneVisible;
-            if (_editHistoryPaneVisible)
+            UpdateBottomStripVisibility();
+            RefreshEditHistoryListBox();
+        }
+
+        private void MyNotesMenuItem_Click(object? sender, EventArgs e)
+        {
+            _myNotesPaneVisible = _myNotesMenuItem?.Checked ?? false;
+            if (_bottomSplitContainer != null)
+                _bottomSplitContainer.Panel2Collapsed = !_myNotesPaneVisible;
+            UpdateBottomStripVisibility();
+            if (_bottomSplitContainer != null && _myNotesPaneVisible && _editHistoryPaneVisible && _bottomSplitContainer.Width > 0)
+                _bottomSplitContainer.SplitterDistance = _bottomSplitContainer.Width / 2;
+        }
+
+        private void WorkspacePaneMenuItem_Click(object? sender, EventArgs e)
+        {
+            _workspacePaneVisible = _workspacePaneMenuItem?.Checked ?? false;
+            splitContainer1.Panel1Collapsed = !_workspacePaneVisible;
+            SaveWindowSettings();
+        }
+
+        private void UpdateBottomStripVisibility()
+        {
+            if (_workspaceSplitContainer == null || _bottomSplitContainer == null) return;
+            bool anyVisible = _editHistoryPaneVisible || _myNotesPaneVisible;
+            _workspaceSplitContainer.Panel2Collapsed = !anyVisible;
+            _bottomSplitContainer.Panel1Collapsed = !_editHistoryPaneVisible;
+            _bottomSplitContainer.Panel2Collapsed = !_myNotesPaneVisible;
+            if (anyVisible)
             {
                 int total = _workspaceSplitContainer.Height - _workspaceSplitContainer.SplitterWidth;
                 if (total > EditHistoryPaneHeight + 60)
                     _workspaceSplitContainer.SplitterDistance = total - EditHistoryPaneHeight;
             }
-            RefreshEditHistoryListBox();
+            if (_editHistoryPaneVisible && _myNotesPaneVisible && _bottomSplitContainer.Width > 0)
+                _bottomSplitContainer.SplitterDistance = _bottomSplitContainer.Width / 2;
         }
 
         private List<EditHistoryItem> GetEditHistoryListForFilePath(string filePath)
@@ -1374,6 +1750,235 @@ namespace D2_Horadrim
                 TextRenderer.DrawText(e.Graphics, item.DisplayText, normalFont, new Rectangle(x, e.Bounds.Y, e.Bounds.Width - (x - e.Bounds.X), e.Bounds.Height), normalColor, flags);
             }
             e.DrawFocusRectangle();
+        }
+
+        public bool PreFilterMessage(ref Message m)
+        {
+            // Block Alt key system messages so the menu bar is not activated; Alt+key combos still work (they use the other key's message)
+            if ((m.Msg == WM_SYSKEYDOWN || m.Msg == WM_SYSKEYUP) && m.WParam.ToInt32() == VK_MENU)
+                return true;
+            return false;
+        }
+
+        private IntPtr LowLevelKeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode < 0)
+                return CallNextHookEx(_lowLevelHookHandle, nCode, wParam, lParam);
+
+            IntPtr fg = GetForegroundWindow();
+            if (fg == IntPtr.Zero || GetWindowThreadProcessId(fg, out uint pid) == 0 || pid != System.Diagnostics.Process.GetCurrentProcess().Id)
+                return CallNextHookEx(_lowLevelHookHandle, nCode, wParam, lParam);
+
+            var kbd = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+            int wp = wParam.ToInt32();
+
+            if (wp == WM_SYSKEYDOWN)
+            {
+                if (kbd.vkCode == VK_MENU)
+                    _altKeyLogicalDown = true;
+                else
+                    PostMessage(Handle, WM_HOTKEY_ALT, (IntPtr)kbd.vkCode, IntPtr.Zero);
+                return (IntPtr)1;
+            }
+            if (wp == WM_SYSKEYUP)
+            {
+                if (kbd.vkCode == VK_MENU)
+                    _altKeyLogicalDown = false;
+                return (IntPtr)1;
+            }
+            if ((wp == WM_KEYDOWN || wp == WM_KEYUP) && kbd.vkCode == VK_MENU)
+            {
+                if (wp == WM_KEYDOWN)
+                    _altKeyLogicalDown = true;
+                else
+                    _altKeyLogicalDown = false;
+                return (IntPtr)1;
+            }
+
+            return CallNextHookEx(_lowLevelHookHandle, nCode, wParam, lParam);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == (int)WM_HOTKEY_ALT)
+            {
+                HandleAltHotkey(m.WParam.ToInt32());
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        private static readonly int VK_A = 0x41, VK_C = 0x43, VK_D = 0x44, VK_E = 0x45, VK_F = 0x46, VK_H = 0x48, VK_I = 0x49, VK_N = 0x4E, VK_R = 0x52, VK_U = 0x55, VK_W = 0x57;
+
+        private void HandleAltHotkey(int vkCode)
+        {
+            // Global toggles (work anywhere)
+            if (vkCode == VK_E) { ToggleEditHistoryPane(); return; }
+            if (vkCode == VK_N) { ToggleNotesPane(); return; }
+            if (vkCode == VK_W) { ToggleWorkspacePane(); return; }
+            if (vkCode == VK_D) { ToggleHeaderTooltips(); return; }
+
+            // Row/column operations (require grid with selection)
+            var dgv = GetCurrentGrid();
+            if (dgv == null) return;
+            bool columnOp = PreferColumnOperation(dgv);
+
+            if (vkCode == VK_F)
+            {
+                ToggleFreezeSelectedColumnsOrRows(dgv, columnOp);
+                return;
+            }
+            if (vkCode == VK_A) { if (columnOp) ColumnOptions_Add(); else RowOptions_Add(); return; }
+            if (vkCode == VK_I) { if (columnOp) ColumnOptions_Insert(); else RowOptions_Insert(); return; }
+            if (vkCode == VK_R) { if (columnOp) ColumnOptions_Remove(); else RowOptions_Remove(); return; }
+            if (vkCode == VK_C) { if (columnOp) ColumnOptions_Clone(); else RowOptions_Clone(); return; }
+            if (vkCode == VK_H) { if (columnOp) ColumnOptions_Hide(); else RowOptions_Hide(); return; }
+            if (vkCode == VK_U) { if (columnOp) ColumnOptions_Unhide(); else RowOptions_Unhide(); return; }
+        }
+
+        private bool PreferColumnOperation(DataGridView dgv)
+        {
+            if (dgv.SelectedCells.Count == 0) return true;
+            var cols = dgv.SelectedCells.Cast<DataGridViewCell>().Where(c => dgv.Columns[c.ColumnIndex].Name != OriginalIndexColumnName).Select(c => c.ColumnIndex).Distinct().Count();
+            var rows = dgv.SelectedCells.Cast<DataGridViewCell>().Where(c => c.RowIndex >= 0 && !dgv.Rows[c.RowIndex].IsNewRow).Select(c => c.RowIndex).Distinct().Count();
+            // Selection taller than wide (e.g. one column) -> column op; wider than tall (e.g. one row) -> row op
+            return rows > cols;
+        }
+
+        /// <summary>
+        /// Toggle freeze on the currently selected column(s) or row(s), using the same apply/refresh logic as the Settings "Always lock header column/row" and Alt+Click on header.
+        /// </summary>
+        private void ToggleFreezeSelectedColumnsOrRows(DataGridView dgv, bool columnOp)
+        {
+            if (dgv == null)
+                return;
+
+            dataGridView = dgv;
+
+            if (columnOp)
+            {
+                // =========================
+                // COLUMN LOCK / UNLOCK
+                // =========================
+
+                var colIndices = dgv.SelectedCells
+                    .Cast<DataGridViewCell>()
+                    .Select(c => c.ColumnIndex)
+                    .Distinct()
+                    .Where(c =>
+                        c >= 0 &&
+                        c < dgv.Columns.Count &&
+                        dgv.Columns[c].Name != OriginalIndexColumnName)
+                    .ToList();
+
+                // Fallback to current cell if nothing selected
+                if (colIndices.Count == 0 &&
+                    dgv.CurrentCell != null &&
+                    dgv.CurrentCell.ColumnIndex >= 0 &&
+                    dgv.CurrentCell.ColumnIndex < dgv.Columns.Count &&
+                    dgv.Columns[dgv.CurrentCell.ColumnIndex].Name != OriginalIndexColumnName)
+                {
+                    colIndices.Add(dgv.CurrentCell.ColumnIndex);
+                }
+
+                if (colIndices.Count == 0)
+                    return;
+
+                foreach (int c in colIndices)
+                {
+                    if (lockedColumns.Contains(c))
+                        lockedColumns.Remove(c);
+                    else
+                        lockedColumns.Add(c);
+                }
+
+                // Row header is never lockable
+                lockedColumns.Remove(-1);
+
+                ApplyFrozenColumns();
+                ApplyRowStyles(dgv);
+                ApplyHeaderCellColors(dgv);
+                RefreshColumnHeaders(dgv);
+                dgv.Invalidate();
+            }
+            else
+            {
+                // =========================
+                // ROW LOCK / UNLOCK
+                // =========================
+
+                lockedRows.Remove(-1); // never lock row header
+
+                var rowIndices = dgv.SelectedCells
+                    .Cast<DataGridViewCell>()
+                    .Select(c => c.RowIndex)
+                    .Distinct()
+                    .Where(r =>
+                        r >= 0 &&
+                        r < dgv.Rows.Count &&
+                        !dgv.Rows[r].IsNewRow)
+                    .ToList();
+
+                // Fallback to current row
+                if (rowIndices.Count == 0 &&
+                    dgv.CurrentCell != null &&
+                    dgv.CurrentCell.RowIndex >= 0 &&
+                    !dgv.Rows[dgv.CurrentCell.RowIndex].IsNewRow)
+                {
+                    rowIndices.Add(dgv.CurrentCell.RowIndex);
+                }
+
+                if (rowIndices.Count == 0)
+                    return;
+
+                foreach (int r in rowIndices)
+                {
+                    if (lockedRows.Contains(r))
+                        lockedRows.Remove(r);
+                    else
+                        lockedRows.Add(r);
+                }
+
+                ApplyFrozenRows();
+                ApplyHeaderCellColors(dgv);
+                RefreshColumnHeaders(dgv);
+                dgv.Invalidate();
+            }
+        }
+
+
+        private void ToggleEditHistoryPane()
+        {
+            _editHistoryPaneVisible = !_editHistoryPaneVisible;
+            if (_editHistoryMenuItem != null) _editHistoryMenuItem.Checked = _editHistoryPaneVisible;
+            UpdateBottomStripVisibility();
+            RefreshEditHistoryListBox();
+        }
+
+        private void ToggleNotesPane()
+        {
+            _myNotesPaneVisible = !_myNotesPaneVisible;
+            if (_myNotesMenuItem != null) _myNotesMenuItem.Checked = _myNotesPaneVisible;
+            if (_bottomSplitContainer != null) _bottomSplitContainer.Panel2Collapsed = !_myNotesPaneVisible;
+            UpdateBottomStripVisibility();
+            if (_bottomSplitContainer != null && _myNotesPaneVisible && _editHistoryPaneVisible && _bottomSplitContainer.Width > 0)
+                _bottomSplitContainer.SplitterDistance = _bottomSplitContainer.Width / 2;
+        }
+
+        private void ToggleWorkspacePane()
+        {
+            _workspacePaneVisible = !_workspacePaneVisible;
+            if (_workspacePaneMenuItem != null) _workspacePaneMenuItem.Checked = _workspacePaneVisible;
+            splitContainer1.Panel1Collapsed = !_workspacePaneVisible;
+            SaveWindowSettings();
+        }
+
+        private void ToggleHeaderTooltips()
+        {
+            _headerTooltipsFromDataGuide = !_headerTooltipsFromDataGuide;
+            if (_headerTooltipsFromDataGuideMenuItem != null) _headerTooltipsFromDataGuideMenuItem.Checked = _headerTooltipsFromDataGuide;
+            SaveWindowSettings();
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -1571,11 +2176,7 @@ namespace D2_Horadrim
             ScrollEditHistoryToBottom();
         }
 
-        private void PushUndoEntry(string filePath, List<(int row, int col, string value)> entry, string description,
-            string? columnName = null, string? rowName = null, string? oldValue = null, string? newValue = null,
-            string? pasteValue = null, string? pasteCount = null, string? pasteCellRange = null,
-            string? mathOperation = null, string? mathValue = null, string? mathColumnName = null, string? mathCellRange = null,
-            string? mathRoundDirection = null, string? mathFormatKind = null)
+        private void PushUndoEntry(string filePath, List<(int row, int col, string value)> entry, string description, string? columnName = null, string? rowName = null, string? oldValue = null, string? newValue = null, string? pasteValue = null, string? pasteCount = null, string? pasteCellRange = null, string? mathOperation = null, string? mathValue = null, string? mathColumnName = null, string? mathCellRange = null, string? mathRoundDirection = null, string? mathFormatKind = null)
         {
             if (entry.Count == 0) return;
             if (_isApplyingUndo) return;
@@ -1811,6 +2412,20 @@ namespace D2_Horadrim
             dataGridView.Invalidate();
         }
 
+        private void ApplyDefaultHeaderLocksIfEnabled()
+        {
+            if (dataGridView == null || dataGridView.DataSource is not DataTable table) return;
+            if (table.Rows.Count == 0) return;
+            if (_alwaysLockHeaderColumn && dataGridView.Columns.Count > 0)
+            {
+                int firstDataCol = GetFirstDataColumnIndex(dataGridView);
+                if (firstDataCol >= 0 && !lockedColumns.Contains(firstDataCol))
+                    lockedColumns.Add(firstDataCol);
+            }
+            if (_alwaysLockHeaderRow && !lockedRows.Contains(0))
+                lockedRows.Add(0);
+        }
+
         private void UpdateColumnHeaders()
         {
             if (dataGridView == null) return;
@@ -1889,12 +2504,14 @@ namespace D2_Horadrim
 
         private void DataGridView_ColumnHeaderMouseClick(object sender, DataGridViewCellMouseEventArgs e)
         {
-            if (dataGridView == null || e.RowIndex != -1 || e.ColumnIndex < 0) return;
+            var dgv = (DataGridView)sender;
+            if (dgv == null || e.RowIndex != -1 || e.ColumnIndex < 0) return;
+            dataGridView = dgv;
 
             int columnIndex = e.ColumnIndex;
-            dataGridView.Columns[columnIndex].SortMode = DataGridViewColumnSortMode.NotSortable;
+            dgv.Columns[columnIndex].SortMode = DataGridViewColumnSortMode.NotSortable;
 
-            if ((Control.ModifierKeys & Keys.Alt) == Keys.Alt)
+            if (_altKeyLogicalDown || (Control.ModifierKeys & Keys.Alt) == Keys.Alt)
             {
                 if (lockedColumns.Contains(columnIndex))
                     lockedColumns.Remove(columnIndex);
@@ -1902,9 +2519,9 @@ namespace D2_Horadrim
                     lockedColumns.Add(columnIndex);
                 ApplyFrozenColumns();
                 ApplyRowStyles();
-                ApplyHeaderCellColors(dataGridView);
-                RefreshColumnHeaders();
-                dataGridView.Invalidate();
+                ApplyHeaderCellColors(dgv);
+                RefreshColumnHeaders(dgv);
+                dgv.Invalidate();
             }
             else
             {
@@ -1950,19 +2567,21 @@ namespace D2_Horadrim
 
         private void DataGridView_RowHeaderMouseClick(object sender, DataGridViewCellMouseEventArgs e)
         {
-            if (dataGridView == null || e.RowIndex < 0) return;
+            var dgv = (DataGridView)sender;
+            if (dgv == null || e.RowIndex < 0) return;
+            dataGridView = dgv;
 
             int rowIndex = e.RowIndex;
-            if (dataGridView.Rows[rowIndex].IsNewRow) return;
+            if (dgv.Rows[rowIndex].IsNewRow) return;
 
-            if ((Control.ModifierKeys & Keys.Alt) == Keys.Alt)
+            if (_altKeyLogicalDown || (Control.ModifierKeys & Keys.Alt) == Keys.Alt)
             {
                 if (lockedRows.Contains(rowIndex))
                     lockedRows.Remove(rowIndex);
                 else
                     lockedRows.Add(rowIndex);
                 ApplyFrozenRows();
-                dataGridView.Invalidate();
+                dgv.Invalidate();
             }
             else
             {
@@ -2006,23 +2625,38 @@ namespace D2_Horadrim
 
         private void ApplyFrozenColumns()
         {
-            if (dataGridView == null) return;
-            for (int c = 0; c < dataGridView.Columns.Count; c++)
-                dataGridView.Columns[c].Frozen = false;
-            var sortedLocked = lockedColumns.OrderBy(i => i).ToList();
-            int displayIdx = 0;
-            foreach (int colIndex in sortedLocked)
+            if (dataGridView == null)
+                return;
+
+            var dgv = dataGridView;
+
+            // Clear frozen state first
+            foreach (DataGridViewColumn col in dgv.Columns)
+                col.Frozen = false;
+
+            // Sort locked columns by original index
+            var frozenCols = lockedColumns
+                .Where(i => i >= 0 && i < dgv.Columns.Count)
+                .OrderBy(i => i)
+                .ToList();
+
+            // Move frozen columns to the left, contiguously
+            int displayIndex = 0;
+            foreach (int colIndex in frozenCols)
             {
-                if (colIndex >= 0 && colIndex < dataGridView.Columns.Count)
-                    dataGridView.Columns[colIndex].DisplayIndex = displayIdx++;
+                dgv.Columns[colIndex].DisplayIndex = displayIndex++;
             }
-            for (int c = 0; c < dataGridView.Columns.Count; c++)
+
+            // Move remaining columns after frozen block
+            foreach (DataGridViewColumn col in dgv.Columns)
             {
-                if (!lockedColumns.Contains(c))
-                    dataGridView.Columns[c].DisplayIndex = displayIdx++;
+                if (!frozenCols.Contains(col.Index))
+                    col.DisplayIndex = displayIndex++;
             }
-            for (int c = 0; c < dataGridView.Columns.Count; c++)
-                dataGridView.Columns[c].Frozen = lockedColumns.Contains(c);
+
+            // Now freeze the leftmost block
+            foreach (int colIndex in frozenCols)
+                dgv.Columns[colIndex].Frozen = true;
         }
 
         private void ApplyFrozenRows()
@@ -2084,6 +2718,7 @@ namespace D2_Horadrim
             }
             var unlockedIndices = Enumerable.Range(0, table.Rows.Count).Where(i => i != 0 && !lockedRows.Contains(i)).ToList();
             var lockedExcludingHeader = sortedLocked.Where(i => i != 0).ToList();
+            bool headerRowLocked = sortedLocked.Contains(0);
             var newOrder = new List<int> { 0 }; // Row 0 = header always first
             newOrder.AddRange(lockedExcludingHeader);
             newOrder.AddRange(unlockedIndices);
@@ -2098,12 +2733,15 @@ namespace D2_Horadrim
             HideOriginalIndexColumn();
             UpdateColumnHeaders();
             ApplyFrozenColumns();
-            int frozenCount = 1 + lockedExcludingHeader.Count; // row 0 (header) + locked data rows
-            lockedRows = Enumerable.Range(0, frozenCount).ToHashSet();
+            // Only count row 0 as locked when the user explicitly locked it; do not auto-lock the header row.
+            int lockedCount = (headerRowLocked ? 1 : 0) + lockedExcludingHeader.Count;
+            int lockedStart = headerRowLocked ? 0 : 1;
+            lockedRows = Enumerable.Range(lockedStart, lockedCount).ToHashSet();
+            // Freeze exactly the rows that are in lockedRows (their indices after reorder) so they stay visible when scrolling down.
             for (int i = 0; i < dataGridView.Rows.Count; i++)
             {
                 if (dataGridView.Rows[i].IsNewRow) continue;
-                dataGridView.Rows[i].Frozen = i < frozenCount;
+                dataGridView.Rows[i].Frozen = lockedRows.Contains(i);
             }
             ApplyRowStyles();
             ApplyHeaderCellColors(dataGridView);
@@ -2113,8 +2751,13 @@ namespace D2_Horadrim
 
         private void RefreshColumnHeaders()
         {
-            if (dataGridView == null) return;
-            foreach (DataGridViewColumn column in dataGridView.Columns)
+            RefreshColumnHeaders(dataGridView);
+        }
+
+        private void RefreshColumnHeaders(DataGridView? dgv)
+        {
+            if (dgv == null) return;
+            foreach (DataGridViewColumn column in dgv.Columns)
             {
                 if (lockedColumns.Contains(column.Index))
                 {
@@ -2128,39 +2771,41 @@ namespace D2_Horadrim
                 }
             }
 
-            dataGridView.Invalidate();
+            dgv.Invalidate();
         }
 
         private void DataGridView_CellPainting(object sender, DataGridViewCellPaintingEventArgs e)
         {
             var dgv = (DataGridView)sender;
+
+            // COLUMN HEADERS (A, B, C…) — always header color; lock icon still shown for locked columns
             if (e.RowIndex == -1)
             {
-                int columnIndex = e.ColumnIndex;
-                if (columnIndex < 0 || columnIndex >= dgv.Columns.Count)
+                if (e.ColumnIndex < 0 || e.ColumnIndex >= dgv.Columns.Count)
                 {
                     e.PaintBackground(e.ClipBounds, true);
                     e.Handled = true;
                     return;
                 }
 
-                // Always use theme colors so headers stay correct after add/insert column
-                Color back = lockedColumns.Contains(columnIndex) ? _gridFrozenColor : _gridHeaderColor;
+                bool isLocked = e.ColumnIndex > 0 && lockedColumns.Contains(e.ColumnIndex);
+                Color back = _gridHeaderColor; // header labels never get frozen color
                 Color fore = TextColorHeaderActive;
+
                 using (var backBrush = new SolidBrush(back))
                     e.Graphics.FillRectangle(backBrush, e.CellBounds);
 
-                var bounds = e.CellBounds;
-                string letter = GetColumnLetter(columnIndex);
+                string letter = GetColumnLetter(e.ColumnIndex);
                 var font = e.CellStyle?.Font ?? SystemFonts.DefaultFont;
+
                 using (var letterFont = new Font(font.FontFamily, 9f, FontStyle.Bold))
-                using (var headerBrush = new SolidBrush(fore))
-                using (var letterFormat = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                using (var textBrush = new SolidBrush(fore))
+                using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
                 {
-                    e.Graphics.DrawString(letter, letterFont, headerBrush, bounds, letterFormat);
+                    e.Graphics.DrawString(letter, letterFont, textBrush, e.CellBounds, sf);
                 }
 
-                if (lockedColumns.Contains(columnIndex))
+                if (isLocked)
                 {
                     int padding = -10;
                     int imageX = e.CellBounds.Right - lockImage.Width - padding;
@@ -2169,18 +2814,22 @@ namespace D2_Horadrim
                 }
 
                 e.Handled = true;
+                return;
             }
-            else if (e.ColumnIndex == -1 && e.RowIndex >= 0)
+
+            // ROW HEADERS (0, 1, 2, 3…) — always header/expansion color; lock icon still shown for locked rows
+            if (e.ColumnIndex == -1 && e.RowIndex >= 0)
             {
-                // Always use theme colors so row headers stay correct after add/insert column
                 int firstDataCol = GetFirstDataColumnIndex(dgv);
                 bool expansionRow = IsExpansionRow(dgv, e.RowIndex, firstDataCol);
-                Color back = e.RowIndex == 0 ? _gridHeaderColor : (expansionRow ? _gridExpansionRowColor : (lockedRows.Contains(e.RowIndex) ? _gridFrozenColor : _gridHeaderColor));
+
+                bool isLocked = e.RowIndex > 0 && lockedRows.Contains(e.RowIndex);
+                Color back = expansionRow ? _gridExpansionRowColor : _gridHeaderColor; // header labels never get frozen color
                 Color fore = TextColorHeaderActive;
+
                 using (var backBrush = new SolidBrush(back))
                     e.Graphics.FillRectangle(backBrush, e.CellBounds);
 
-                var bounds = e.CellBounds;
                 string rowNumber = (e.RowIndex + 1).ToString();
                 if (dgv.Columns.Contains(OriginalIndexColumnName))
                 {
@@ -2189,36 +2838,47 @@ namespace D2_Horadrim
                         rowNumber = (origIdx + 1).ToString();
                 }
 
-                using (var brush = new SolidBrush(fore))
+                using (var textBrush = new SolidBrush(fore))
                 using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
                 {
-                    e.Graphics.DrawString(rowNumber, e.CellStyle?.Font ?? SystemFonts.DefaultFont, brush, bounds, sf);
+                    e.Graphics.DrawString(rowNumber, e.CellStyle?.Font ?? SystemFonts.DefaultFont, textBrush, e.CellBounds, sf);
                 }
-                if (lockedRows.Contains(e.RowIndex))
+
+                if (isLocked)
                 {
-                    int imageX = bounds.Right + 14 - lockImage.Width - 2;
-                    int imageY = bounds.Top + 2;
+                    int imageX = e.CellBounds.Right - lockImage.Width + 10;
+                    int imageY = e.CellBounds.Top + 2;
                     e.Graphics.DrawImage(lockImage, imageX, imageY);
                 }
+
                 e.Handled = true;
+                return;
             }
-            else if (e.RowIndex >= 0 && e.ColumnIndex >= 0 && dgv == GetCurrentGrid()
-                && _searchMatches.Count > 0 && _searchCurrentIndex >= 0 && _searchCurrentIndex < _searchMatches.Count
-                && _searchMatches[_searchCurrentIndex].row == e.RowIndex && _searchMatches[_searchCurrentIndex].col == e.ColumnIndex)
+
+            // SEARCH HIGHLIGHTED CELLS
+            if (e.RowIndex >= 0 && e.ColumnIndex >= 0 && dgv == GetCurrentGrid() && _searchMatches.Count > 0 && _searchCurrentIndex >= 0 && _searchCurrentIndex < _searchMatches.Count)
             {
-                using (var backBrush = new SolidBrush(_gridSearchHighlightColor))
-                    e.Graphics.FillRectangle(backBrush, e.CellBounds);
-                var val = dgv.Rows[e.RowIndex].Cells[e.ColumnIndex].Value?.ToString() ?? "";
-                var foreColor = e.CellStyle?.ForeColor ?? TextColorCellActive;
-                using (var foreBrush = new SolidBrush(foreColor))
-                using (var sf = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center })
+                var match = _searchMatches[_searchCurrentIndex];
+                if (match.row == e.RowIndex && match.col == e.ColumnIndex)
                 {
-                    var rect = new Rectangle(e.CellBounds.X + 2, e.CellBounds.Y, e.CellBounds.Width - 4, e.CellBounds.Height);
-                    e.Graphics.DrawString(val, e.CellStyle?.Font ?? dgv.Font, foreBrush, rect, sf);
+                    using (var backBrush = new SolidBrush(_gridSearchHighlightColor))
+                        e.Graphics.FillRectangle(backBrush, e.CellBounds);
+
+                    string val = dgv.Rows[e.RowIndex].Cells[e.ColumnIndex].Value?.ToString() ?? "";
+                    Color fore = e.CellStyle?.ForeColor ?? TextColorCellActive;
+
+                    using (var foreBrush = new SolidBrush(fore))
+                    using (var sf = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center })
+                    {
+                        var rect = new Rectangle(e.CellBounds.X + 2, e.CellBounds.Y, e.CellBounds.Width - 4,e.CellBounds.Height);
+                        e.Graphics.DrawString(val, e.CellStyle?.Font ?? dgv.Font, foreBrush, rect, sf);
+                    }
+
+                    e.Handled = true;
                 }
-                e.Handled = true;
             }
         }
+
 
         private void DisableColumnSorting()
         {
@@ -2262,6 +2922,68 @@ namespace D2_Horadrim
             }
         }
 
+        private const string D2CompareSourceWorkspaceName = "D2Compare (Source)";
+        private static string D2CompareSourceWorkspaceKey => D2CompareSourceWorkspaceName.Replace(" ", "_");
+
+        private void EnsureStartupWorkspaceForFile(string filePath, string? role, string? originFolder)
+        {
+            string effectiveFolder = !string.IsNullOrWhiteSpace(originFolder)
+                ? originFolder
+                : (Path.GetDirectoryName(filePath) ?? string.Empty);
+
+            string roleText = string.IsNullOrWhiteSpace(role) ? "Source" : role!;
+            string workspaceName = $"D2Compare ({roleText})";
+            string key = workspaceName.Replace(" ", "_");
+            TreeNode? workspaceNode = treeView.Nodes.ContainsKey(key) ? treeView.Nodes[key] : null;
+            if (workspaceNode == null)
+            {
+                // Use a color that is not already used by any existing workspace.
+                Color color = GetNextUnusedWorkspaceColor();
+                var tag = new WorkspaceTag { FolderPath = effectiveFolder, BackColor = color };
+                workspaceNode = new TreeNode(workspaceName) { Name = key, Tag = tag, BackColor = color };
+                treeView.Nodes.Add(workspaceNode);
+
+                if (Directory.Exists(effectiveFolder))
+                {
+                    foreach (var file in Directory.GetFiles(effectiveFolder, "*.txt"))
+                        workspaceNode.Nodes.Add(new TreeNode(Path.GetFileName(file)) { Tag = file });
+                }
+
+                // Ensure the startup file node exists even if it is outside the origin folder
+                string pathNorm = NormalizeFilePath(filePath);
+                bool hasFile = false;
+                foreach (TreeNode child in workspaceNode.Nodes)
+                {
+                    if (child.Tag is string tagPath && string.Equals(NormalizeFilePath(tagPath), pathNorm, StringComparison.OrdinalIgnoreCase))
+                    {
+                        hasFile = true;
+                        break;
+                    }
+                }
+                if (!hasFile)
+                    workspaceNode.Nodes.Add(new TreeNode(Path.GetFileName(filePath)) { Tag = filePath });
+                SaveWorkspacesConfig();
+                ApplyTextColors();
+            }
+            else
+            {
+                if (workspaceNode.Tag is WorkspaceTag existingTag &&
+                    string.IsNullOrEmpty(existingTag.FolderPath) &&
+                    !string.IsNullOrEmpty(effectiveFolder))
+                {
+                    existingTag.FolderPath = effectiveFolder;
+                    workspaceNode.Tag = existingTag;
+                }
+
+                string pathNorm = NormalizeFilePath(filePath);
+                foreach (TreeNode child in workspaceNode.Nodes)
+                    if (child.Tag is string tagPath && string.Equals(NormalizeFilePath(tagPath), pathNorm, StringComparison.OrdinalIgnoreCase))
+                        return;
+                workspaceNode.Nodes.Add(new TreeNode(Path.GetFileName(filePath)) { Tag = filePath });
+                SaveWorkspacesConfig();
+            }
+        }
+
         private string GetNextWorkspaceName()
         {
             int idx = 1;
@@ -2275,6 +2997,27 @@ namespace D2_Horadrim
             Color c = DefaultWorkspaceColors[_nextDefaultColorIndex % DefaultWorkspaceColors.Length];
             _nextDefaultColorIndex++;
             return c;
+        }
+
+        // Choose a workspace color that is not already used by any existing root workspace node.
+        // Falls back to the default cycling behavior if all palette colors are in use.
+        private Color GetNextUnusedWorkspaceColor()
+        {
+            var used = new HashSet<int>();
+            foreach (TreeNode root in treeView.Nodes)
+            {
+                if (root.Tag is WorkspaceTag tag)
+                    used.Add(tag.BackColor.ToArgb());
+            }
+
+            foreach (var c in DefaultWorkspaceColors)
+            {
+                if (!used.Contains(c.ToArgb()))
+                    return c;
+            }
+
+            // All default colors are already used; reuse via normal cycling.
+            return GetNextDefaultColor();
         }
 
         private static void CenteredSymbolButton_Paint(object? sender, PaintEventArgs e)
@@ -2576,6 +3319,38 @@ namespace D2_Horadrim
             if (!Directory.Exists(dir))
                 Directory.CreateDirectory(dir);
             return Path.Combine(dir, "workspaces.json");
+        }
+
+        private static string GetMyNotesFilePath()
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "D2_Horadrim");
+            return Path.Combine(dir, "mynotes.txt");
+        }
+
+        private void LoadMyNotes()
+        {
+            if (_myNotesTextBox == null) return;
+            try
+            {
+                string path = GetMyNotesFilePath();
+                if (File.Exists(path))
+                    _myNotesTextBox.Text = File.ReadAllText(path);
+            }
+            catch { }
+        }
+
+        private void SaveMyNotes()
+        {
+            if (_myNotesTextBox == null) return;
+            try
+            {
+                string path = GetMyNotesFilePath();
+                string? dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir))
+                    Directory.CreateDirectory(dir);
+                File.WriteAllText(path, _myNotesTextBox.Text);
+            }
+            catch { }
         }
 
         private void SaveWorkspacesConfig()
@@ -3325,6 +4100,7 @@ namespace D2_Horadrim
             dgv.ColumnHeaderMouseClick += DataGridView_ColumnHeaderMouseClick;
             dgv.RowHeaderMouseClick += DataGridView_RowHeaderMouseClick;
             dgv.ColumnWidthChanged += DataGridView_ColumnWidthChanged;
+            dgv.RowHeightChanged += DataGridView_RowHeightChanged;
             dgv.MouseMove += DataGuideHeaderMouseMoveFromTabOrGrid;
             dgv.MouseLeave += HeaderTooltipGrid_MouseLeave;
             dgv.ContextMenuStrip = contextMenuStrip1;
@@ -3428,7 +4204,10 @@ namespace D2_Horadrim
             dataGridView = dgv;
 
             HideOriginalIndexColumn();
+            ApplyDefaultHeaderLocksIfEnabled();
             UpdateColumnHeaders();
+            ApplyFrozenColumns();
+            ApplyFrozenRows();
             ApplyRowStyles();
             DisableColumnSorting();
             if (_adaptiveColumnWidthMenuItem?.Checked == true)
@@ -3440,6 +4219,33 @@ namespace D2_Horadrim
                 _inGroupedColumnWidthSync = true;
                 try { dgv.AutoResizeColumns(DataGridViewAutoSizeColumnsMode.AllCells); }
                 finally { _inGroupedColumnWidthSync = false; }
+            }
+            string pathNormalize = NormalizeFilePath(filePath);
+            if (!string.IsNullOrEmpty(pathNorm))
+            {
+                if (_savedColumnWidthsByFile.TryGetValue(pathNorm, out int[]? widths))
+                {
+                    _inGroupedColumnWidthSync = true;
+                    try
+                    {
+                        for (int i = 0; i < dgv.Columns.Count && i < widths.Length; i++)
+                            dgv.Columns[i].Width = widths[i];
+                    }
+                    finally { _inGroupedColumnWidthSync = false; }
+                }
+                if (_savedRowHeightsByFile.TryGetValue(pathNorm, out int[]? heights))
+                {
+                    _inGroupedRowHeightSync = true;
+                    try
+                    {
+                        for (int i = 0; i < dgv.Rows.Count && i < heights.Length; i++)
+                        {
+                            if (dgv.Rows[i].IsNewRow) continue;
+                            dgv.Rows[i].Height = heights[i];
+                        }
+                    }
+                    finally { _inGroupedRowHeightSync = false; }
+                }
             }
             if (dgv.DataSource is DataTable initialTable)
                 StoreSavedContent(filePath, GetContentStringFromTable(initialTable));
@@ -3458,35 +4264,10 @@ namespace D2_Horadrim
             onComplete?.Invoke();
         }
 
-        private void LoadProgressTimer_Tick(object? sender, EventArgs e)
-        {
-            _loadProgressTimerTickCount++;
-            if (_loadProgressBar == null || _loadProgressPanel == null || _loadProgressLabel == null || !_loadProgressPanel.Visible)
-                return;
-            long total = _loadProgressTotalBytes;
-            long read = Interlocked.Read(ref _loadProgressBytesRead);
-            if (total > 0)
-            {
-                int pct = (int)Math.Min(100, (read * 100) / total);
-                if (pct != _loadProgressBar.Value)
-                {
-                    _loadProgressBar.Value = pct;
-                    _loadProgressBar.Refresh();
-                }
-            }
-            _loadProgressLabel.Text = "Loading " + (read / 1024) + " / " + (total / 1024) + " KB";
-        }
-
         private static DataTable ReadFileToDataTable(string filePath, long fileLen, IProgress<double>? progress)
         {
             var dataTable = new DataTable();
-            Stream stream = new FileStream(
-                filePath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.Read,
-                ProgressStreamReaderBufferSize,
-                FileOptions.SequentialScan);
+            Stream stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, ProgressStreamReaderBufferSize, FileOptions.SequentialScan);
 
             using (stream)
             using (var reader = new StreamReader(stream, Encoding.UTF8, true, ProgressStreamReaderBufferSize))
@@ -3555,9 +4336,6 @@ namespace D2_Horadrim
             return dataTable;
         }
 
-
-
-
         private sealed class ProgressReportingStream : Stream
         {
             private readonly Stream _inner;
@@ -3597,10 +4375,13 @@ namespace D2_Horadrim
                 dataGridView.Columns[OriginalIndexColumnName].Visible = false;
         }
 
-        // Extra width (px) to the right of each tab so the full name is not cut off with "..."
-        private const int TabRightPaddingPixels = 88;
+        // Extra width (px) to the right of each tab (smaller = narrower tabs, less gap between tabs)
+        private const int TabRightPaddingPixels = 40;
         // Space reserved for the close (X) button on each tab
         private const int TabCloseButtonWidth = 15;
+        // Active (selected) tab background color — change these to adjust the red
+        private static readonly Color ActiveTabBackColorDark = Color.FromArgb(149, 215, 251);
+        private static readonly Color ActiveTabBackColorLight = Color.FromArgb(255, 200, 200);
 
         private string GetTabWidthPaddingString()
         {
@@ -3760,43 +4541,196 @@ namespace D2_Horadrim
             return null;
         }
 
-        private void TabControl_DrawItem(object? sender, DrawItemEventArgs e)
+        private void SelectWorkspaceNodeForFile(string filePath)
         {
-            if (e.Index < 0 || e.Index >= tabControl.TabPages.Count) return;
-            TabPage page = tabControl.TabPages[e.Index];
-            Color backColor = (page.Tag as TabTag)?.WorkspaceBackColor ?? page.BackColor;
-            if (backColor == Color.Empty || backColor.A == 0)
-                backColor = SystemColors.Control;
-            using (var brush = new SolidBrush(backColor))
-                e.Graphics.FillRectangle(brush, e.Bounds);
-            bool selected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
-            if (selected)
-            {
-                const int borderWidth = 2;
-                int inset = borderWidth / 2;
-                Rectangle borderRect = new Rectangle(
-                    e.Bounds.X + inset,
-                    e.Bounds.Y + inset,
-                    e.Bounds.Width - borderWidth,
-                    e.Bounds.Height - borderWidth);
-                using (var pen = new Pen(Color.Black, borderWidth))
-                    e.Graphics.DrawRectangle(pen, borderRect);
-            }
-            const int tabTextToCloseGap = 12;
-            int textWidth = Math.Max(0, e.Bounds.Width - 4 - TabCloseButtonWidth - tabTextToCloseGap);
-            Rectangle textBounds = new Rectangle(e.Bounds.X + 4, e.Bounds.Y + 2, textWidth, e.Bounds.Height - 4);
-            string displayText = GetTabDisplayText(page);
-            using (var boldFont = new Font(e.Font ?? tabControl.Font, FontStyle.Bold))
-                TextRenderer.DrawText(e.Graphics, displayText, boldFont, textBounds, TextColorTabActive, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            if (string.IsNullOrWhiteSpace(filePath))
+                return;
 
-            // Draw close button: red background with thick black X (flush right, no padding)
-            int xLeft = e.Bounds.Right - TabCloseButtonWidth - 2;
-            int xTop = e.Bounds.Y + (e.Bounds.Height - TabCloseButtonWidth) / 2;
+            TreeNode? node = FindTreeNodeByFilePath(filePath);
+            if (node != null)
+            {
+                // Ensure workspace is expanded and file node is visible and selected.
+                if (node.Parent != null)
+                    node.Parent.Expand();
+                treeView.SelectedNode = node;
+                node.EnsureVisible();
+            }
+            else
+            {
+                treeView.SelectedNode = null;
+            }
+        }
+
+        private void CompareWorkspaceFile()
+        {
+            TreeNode? fileNode = treeView.SelectedNode;
+            if (fileNode == null || fileNode.Parent == null || fileNode.Tag is not string filePath)
+                return;
+
+            // Collect available workspaces (root nodes with WorkspaceTag)
+            var workspaces = treeView.Nodes.Cast<TreeNode>()
+                .Where(n => n.Tag is WorkspaceTag)
+                .ToList();
+
+            if (workspaces.Count == 0)
+            {
+                MessageBox.Show(this, "No workspaces are defined.", "Compare files", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            // Build dialog UI: choose source and target workspace.
+            using (var dlg = new Form())
+            {
+                dlg.Text = "Select source and target workspaces";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.MinimizeBox = false;
+                dlg.MaximizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.ClientSize = new Size(420, 140);
+
+                var lblSource = new Label { Text = "Source workspace:", AutoSize = true, Location = new Point(12, 15) };
+                var cboSource = new ComboBox
+                {
+                    DropDownStyle = ComboBoxStyle.DropDownList,
+                    Location = new Point(140, 12),
+                    Width = 260
+                };
+
+                var lblTarget = new Label { Text = "Target workspace:", AutoSize = true, Location = new Point(12, 50) };
+                var cboTarget = new ComboBox
+                {
+                    DropDownStyle = ComboBoxStyle.DropDownList,
+                    Location = new Point(140, 47),
+                    Width = 260
+                };
+
+                foreach (var ws in workspaces)
+                {
+                    cboSource.Items.Add(ws.Text);
+                    cboTarget.Items.Add(ws.Text);
+                }
+
+                // Default source to the file's own workspace (its parent), target to a different workspace if available.
+                int sourceIndex = workspaces.FindIndex(ws => ws == fileNode.Parent);
+                if (sourceIndex < 0) sourceIndex = 0;
+                cboSource.SelectedIndex = sourceIndex;
+                cboTarget.SelectedIndex = workspaces.Count > 1 ? (sourceIndex == 0 ? 1 : 0) : sourceIndex;
+
+                var btnOk = new Button
+                {
+                    Text = "OK",
+                    DialogResult = DialogResult.OK,
+                    Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+                    Location = new Point(dlg.ClientSize.Width - 180, 100),
+                    Width = 75
+                };
+                var btnCancel = new Button
+                {
+                    Text = "Cancel",
+                    DialogResult = DialogResult.Cancel,
+                    Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+                    Location = new Point(dlg.ClientSize.Width - 95, 100),
+                    Width = 75
+                };
+
+                dlg.Controls.Add(lblSource);
+                dlg.Controls.Add(cboSource);
+                dlg.Controls.Add(lblTarget);
+                dlg.Controls.Add(cboTarget);
+                dlg.Controls.Add(btnOk);
+                dlg.Controls.Add(btnCancel);
+                dlg.AcceptButton = btnOk;
+                dlg.CancelButton = btnCancel;
+
+                if (dlg.ShowDialog(this) != DialogResult.OK)
+                    return;
+
+                if (cboSource.SelectedIndex < 0 || cboTarget.SelectedIndex < 0)
+                    return;
+
+                var sourceWorkspace = workspaces[cboSource.SelectedIndex];
+                var targetWorkspace = workspaces[cboTarget.SelectedIndex];
+
+                if (sourceWorkspace.Tag is not WorkspaceTag sourceTag || targetWorkspace.Tag is not WorkspaceTag targetTag)
+                    return;
+
+                string fileName = Path.GetFileName(filePath);
+
+                string sourceFolder = sourceTag.FolderPath;
+                string targetFolder = targetTag.FolderPath;
+                if (string.IsNullOrWhiteSpace(sourceFolder) || string.IsNullOrWhiteSpace(targetFolder))
+                {
+                    MessageBox.Show(this, "One or both selected workspaces do not have a valid folder path.", "Compare files", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                string sourceFile = Path.Combine(sourceFolder, fileName);
+                string targetFile = Path.Combine(targetFolder, fileName);
+
+                if (!File.Exists(sourceFile))
+                {
+                    MessageBox.Show(this, $"Source file not found:\n{sourceFile}", "Compare files", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                if (!File.Exists(targetFile))
+                {
+                    MessageBox.Show(this, $"Target file not found:\n{targetFile}", "Compare files", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                string exePath = "C:\\Users\\djsch\\Github\\D2Compare-fork\\src\\D2Compare.UI\\bin\\Debug\\net8.0\\D2Compare.exe";
+
+                if (!File.Exists(exePath))
+                {
+                    MessageBox.Show(this, $"D2Compare.exe was not found in:\n{exePath}", "Compare files", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                try
+                {
+                    var startInfo = new ProcessStartInfo
+                    {
+                        FileName = exePath,
+                        Arguments = $"--source \"{sourceFolder}\" --target \"{targetFolder}\" --file \"{fileName}\"",
+                        UseShellExecute = false
+                    };
+                    Process.Start(startInfo);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, $"Failed to start D2Compare.exe:\n{ex.Message}", "Compare files", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+        }
+
+        private void TabControl_PaintTab(object? sender, PaintTabEventArgs e)
+        {
+            TabPage page = e.Page;
+            bool selected = e.Selected;
+            Rectangle bounds = e.Bounds;
+            Color backColor;
+            if (selected)
+                backColor = _darkMode ? ActiveTabBackColorDark : ActiveTabBackColorLight;
+            else
+            {
+                backColor = (page.Tag as TabTag)?.WorkspaceBackColor ?? page.BackColor;
+                if (backColor == Color.Empty || backColor.A == 0)
+                    backColor = _darkMode ? DarkPanel : SystemColors.Control;
+            }
+            using (var brush = new SolidBrush(backColor))
+                e.Graphics.FillRectangle(brush, bounds);
+            const int tabTextToCloseGap = 12;
+            int textWidth = Math.Max(0, bounds.Width - 4 - TabCloseButtonWidth - tabTextToCloseGap);
+            Rectangle textBounds = new Rectangle(bounds.X + 4, bounds.Y + 2, textWidth, bounds.Height - 4);
+            string displayText = GetTabDisplayText(page);
+            using (var boldFont = new Font(tabControl.Font, FontStyle.Bold))
+                TextRenderer.DrawText(e.Graphics, displayText, boldFont, textBounds, TextColorTabActive, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            int xLeft = bounds.Right - TabCloseButtonWidth - 2;
+            int xTop = bounds.Y + (bounds.Height - TabCloseButtonWidth) / 2;
             Rectangle xRect = new Rectangle(xLeft, xTop, TabCloseButtonWidth, TabCloseButtonWidth);
             using (var redBrush = new SolidBrush(Color.FromArgb(255, 180, 180)))
                 e.Graphics.FillRectangle(redBrush, xRect);
-            using (var borderPen = new Pen(Color.Black, 1f))
-                e.Graphics.DrawRectangle(borderPen, xRect.X, xRect.Y, xRect.Width - 1, xRect.Height - 1);
             int pad = 3;
             int x1 = xRect.X + pad;
             int x2 = xRect.Right - pad;
@@ -3833,6 +4767,8 @@ namespace D2_Horadrim
                 string filePath = (tabControl.SelectedTab.Tag as TabTag)?.FilePath ?? tabControl.SelectedTab.Tag.ToString() ?? "";
                 currentFilePath = filePath;
                 dataGridView = GetGridForTab(tabControl.SelectedTab);
+                // Sync workspace tree selection with the active tab's file, if present.
+                SelectWorkspaceNodeForFile(filePath);
             }
             else
             {
@@ -3885,7 +4821,6 @@ namespace D2_Horadrim
             UpdateDirtyIndicators(filePath);
         }
 
-
         private void UpdateDataGridView(DataTable dataTable)
         {
             dataGridView.Invoke((Action)(() =>
@@ -3918,16 +4853,16 @@ namespace D2_Horadrim
             int firstDataCol = GetFirstDataColumnIndex(dgv);
             foreach (DataGridViewColumn col in dgv.Columns)
             {
-                bool frozen = lockedColumns.Contains(col.Index);
-                col.HeaderCell.Style.BackColor = frozen ? _gridFrozenColor : _gridHeaderColor;
+                // Header labels (A,B,C,D) always use header color, never frozen color
+                col.HeaderCell.Style.BackColor = _gridHeaderColor;
                 col.HeaderCell.Style.ForeColor = headerFore;
             }
             foreach (DataGridViewRow row in dgv.Rows)
             {
                 if (row.IsNewRow) continue;
-                bool frozen = row.Frozen;
                 bool expansionRow = IsExpansionRow(dgv, row.Index, firstDataCol);
-                Color back = (row.Index == 0) ? _gridHeaderColor : (expansionRow ? _gridExpansionRowColor : (frozen ? _gridFrozenColor : _gridHeaderColor));
+                // Header labels (0,1,2,3) always use header/expansion color, never frozen color
+                Color back = (row.Index == 0) ? _gridHeaderColor : (expansionRow ? _gridExpansionRowColor : _gridHeaderColor);
                 row.HeaderCell.Style.BackColor = back;
                 row.HeaderCell.Style.ForeColor = headerFore;
             }
@@ -3983,15 +4918,15 @@ namespace D2_Horadrim
             for (int i = 0; i < dgv.Rows.Count; i++)
             {
                 if (dgv.Rows[i].IsNewRow) continue;
-                bool rowFrozen = dgv.Rows[i].Frozen;
+                bool rowLocked = lockedRows.Contains(i);
                 bool expansionRow = IsExpansionRow(dgv, i, firstDataCol);
                 for (int j = 0; j < dgv.Columns.Count; j++)
                 {
                     if (dgv.Columns[j].Name == OriginalIndexColumnName) continue;
-                    bool colFrozen = dgv.Columns[j].Frozen;
+                    bool colLocked = lockedColumns.Contains(dgv.Columns[j].Index);
                     bool isFirstColumn = dgv.Columns[j].DisplayIndex == 0;
                     Color cellColor;
-                    if (rowFrozen || colFrozen)
+                    if (rowLocked || colLocked)
                         cellColor = _gridFrozenColor;
                     else if (expansionRow)
                         cellColor = _gridExpansionRowColor;
@@ -4000,6 +4935,8 @@ namespace D2_Horadrim
                     else
                         cellColor = (i % 2 == 0 ? _gridEvenRowColor : _gridOddRowColor);
                     dgv.Rows[i].Cells[j].Style.BackColor = cellColor;
+                    Color foreColor = (rowLocked || colLocked) ? TextColorCellFrozenActive : TextColorCellActive;
+                    dgv.Rows[i].Cells[j].Style.ForeColor = foreColor;
                 }
             }
         }
@@ -4051,6 +4988,35 @@ namespace D2_Horadrim
                 if (l < c) return false;
             }
             return false;
+        }
+
+        private void OpenD2RDataguide()
+        {
+            try
+            {
+                string baseDir = AppContext.BaseDirectory ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(baseDir))
+                {
+                    MessageBox.Show(this, "Could not determine application directory.", "Open D2R Dataguide (2.9)", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                string indexPath = Path.Combine(baseDir, "index.html");
+                if (!File.Exists(indexPath))
+                {
+                    MessageBox.Show(this, $"index.html was not found in:\n{baseDir}", "Open D2R Dataguide (2.9)", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                var psi = new ProcessStartInfo
+                {
+                    FileName = indexPath,
+                    UseShellExecute = true
+                };
+                Process.Start(psi);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Failed to open D2R Dataguide:\n{ex.Message}", "Open D2R Dataguide (2.9)", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         private async void CheckForUpdatesAsync()
@@ -4203,10 +5169,16 @@ namespace D2_Horadrim
         {
             e.DrawDefault = false;
             Rectangle fullRow = new Rectangle(0, e.Bounds.Y, treeView.ClientSize.Width, e.Bounds.Height);
-            Color backColor = e.Node.Parent == null && e.Node.BackColor != Color.Empty
+
+            bool isSelected = (e.State & TreeNodeStates.Selected) == TreeNodeStates.Selected;
+
+            // Base colors (workspace nodes keep their custom background)
+            Color baseBackColor = e.Node.Parent == null && e.Node.BackColor != Color.Empty
                 ? e.Node.BackColor
                 : treeView.BackColor;
-            using (var brush = new SolidBrush(backColor))
+            Color textColor = e.Node.ForeColor != Color.Empty ? e.Node.ForeColor : treeView.ForeColor;
+
+            using (var brush = new SolidBrush(baseBackColor))
                 e.Graphics.FillRectangle(brush, fullRow);
 
             const int expandSize = 9;
@@ -4214,7 +5186,6 @@ namespace D2_Horadrim
             int expandX = 2 + indent;
             int expandY = e.Bounds.Y + (e.Bounds.Height - expandSize) / 2;
             var expandRect = new Rectangle(expandX, expandY, expandSize, expandSize);
-            Color textColor = e.Node.ForeColor != Color.Empty ? e.Node.ForeColor : treeView.ForeColor;
             if (e.Node.Nodes.Count > 0)
             {
                 ControlPaint.DrawBorder3D(e.Graphics, expandRect, Border3DStyle.RaisedInner);
@@ -4225,15 +5196,17 @@ namespace D2_Horadrim
             }
             int textX = expandX + expandSize + 2;
             var textRect = new Rectangle(textX, e.Bounds.Y, treeView.ClientSize.Width - textX, e.Bounds.Height);
-            TextRenderer.DrawText(e.Graphics, e.Node.Text, treeView.Font, textRect, textColor, backColor,
+            TextRenderer.DrawText(e.Graphics, e.Node.Text, treeView.Font, textRect, textColor, baseBackColor,
                 TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPrefix);
 
-            if (e.State == TreeNodeStates.Selected)
+            // Draw selection as an outline so workspace colors are never overridden.
+            if (isSelected)
             {
-                using (var selBrush = new SolidBrush(SystemColors.Highlight))
-                    e.Graphics.FillRectangle(selBrush, fullRow);
-                TextRenderer.DrawText(e.Graphics, e.Node.Text, treeView.Font, textRect, SystemColors.HighlightText, SystemColors.Highlight,
-                    TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPrefix);
+                using (var pen = new Pen(SystemColors.Highlight, 1))
+                {
+                    var borderRect = new Rectangle(fullRow.X, fullRow.Y, fullRow.Width - 1, fullRow.Height - 1);
+                    e.Graphics.DrawRectangle(pen, borderRect);
+                }
             }
         }
 
@@ -4244,6 +5217,14 @@ namespace D2_Horadrim
                 toolTip1.SetToolTip(treeView, (hoveredNode.Tag as WorkspaceTag)?.FolderPath ?? hoveredNode.Tag.ToString() ?? "");
             else
                 toolTip1.SetToolTip(treeView, string.Empty);
+        }
+
+        private void TreeView_BeforeLabelEdit(object? sender, NodeLabelEditEventArgs e)
+        {
+            // Only allow editing for workspace root nodes (no parent).
+            // File nodes (children) must never be renamed from the workspace tree.
+            if (e.Node?.Parent != null)
+                e.CancelEdit = true;
         }
 
         private void TreeView_AfterLabelEdit(object? sender, NodeLabelEditEventArgs e)
@@ -4376,6 +5357,19 @@ namespace D2_Horadrim
 
         private void Form1_Load(object sender, EventArgs e)
         {
+            Application.AddMessageFilter(this);
+            _lowLevelHookProc = LowLevelKeyboardHookCallback;
+            _lowLevelHookHandle = SetWindowsHookEx(WH_KEYBOARD_LL, _lowLevelHookProc, IntPtr.Zero, 0);
+            try
+            {
+                var exeIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                if (exeIcon != null)
+                    Icon = exeIcon;
+            }
+            catch { /* use default icon if extraction fails */ }
+            Text = $"D2 Horadrim {GetCurrentVersion()}";
+            string[] args = Environment.GetCommandLineArgs();
+            ParseStartupArgs(args);
             LoadWindowSettings();
             LoadLastDirectory();
             LoadWorkspacesConfig();
@@ -4386,13 +5380,82 @@ namespace D2_Horadrim
             ApplyTextColors();
             if (treeView.Nodes.Count == 0)
                 LoadDirectoryFiles();
-            if (_autoLoadPreviousSession)
+            if(_autoLoadPreviousSession && string.IsNullOrEmpty(_startupFileArgument))
                 LoadOpenFiles();
             DisableColumnSorting();
         }
 
+        private void ParseStartupArgs(string[] args)
+        {
+            _startupFileArgument = null;
+            _startupWorkspaceRole = null;
+            _startupWorkspaceFolder = null;
+            if (args == null || args.Length <= 1) return;
+
+            for (int i = 1; i < args.Length; i++)
+            {
+                string arg = args[i];
+                if (string.IsNullOrWhiteSpace(arg)) continue;
+                string lower = arg.ToLowerInvariant();
+
+                bool isSource = lower.StartsWith("--source");
+                bool isTarget = lower.StartsWith("--target");
+                if (!isSource && !isTarget) continue;
+
+                string role = isSource ? "Source" : "Target";
+
+                // Find the --path flag (it may be combined, e.g. \"--target--path\")
+                int pathFlagIndex = -1;
+                if (lower.Contains("--path"))
+                {
+                    pathFlagIndex = i;
+                }
+                else
+                {
+                    for (int j = i + 1; j < args.Length; j++)
+                    {
+                        string candidate = args[j];
+                        if (string.IsNullOrWhiteSpace(candidate)) continue;
+                        string candLower = candidate.ToLowerInvariant();
+                        if (candLower.Contains("--path"))
+                        {
+                            pathFlagIndex = j;
+                            break;
+                        }
+                    }
+                }
+
+                if (pathFlagIndex >= 0)
+                {
+                    int folderIndex = pathFlagIndex + 1;
+                    int fileIndex = pathFlagIndex + 2;
+                    if (folderIndex < args.Length && fileIndex < args.Length)
+                    {
+                        string folderPath = args[folderIndex];
+                        string fileNamePart = args[fileIndex];
+                        if (!string.IsNullOrWhiteSpace(folderPath) && !string.IsNullOrWhiteSpace(fileNamePart))
+                        {
+                            _startupWorkspaceRole = role;
+                            _startupWorkspaceFolder = folderPath;
+                            _startupFileArgument = Path.Combine(folderPath, fileNamePart);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Fallback to previous behavior if nothing matched
+            if (args.Length > 1 && !string.IsNullOrWhiteSpace(args[1]))
+                _startupFileArgument = args[1].Trim();
+        }
+
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
+            if (!_preserveD2CompareWorkspaces)
+            {
+                RemoveD2CompareWorkspaces();
+            }
+
             SaveWindowSettings();
             SaveWorkspacesConfig();
             SaveOpenFiles();
@@ -4400,15 +5463,23 @@ namespace D2_Horadrim
             SaveGridColors();
             SaveTextColors();
             SaveCustomPaletteColors();
+            SaveMyNotes();
         }
 
         private void Form1_FormClosed(object sender, FormClosedEventArgs e)
         {
+            if (_lowLevelHookHandle != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_lowLevelHookHandle);
+                _lowLevelHookHandle = IntPtr.Zero;
+            }
+            Application.RemoveMessageFilter(this);
             SaveWindowSettings();
         }
 
         private void LoadWindowSettings()
         {
+            WindowState = FormWindowState.Maximized;
             try
             {
                 using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegistryKeyPath))
@@ -4423,18 +5494,32 @@ namespace D2_Horadrim
                         StartPosition = FormStartPosition.Manual;
                         SetBounds(x, y, width, height);
 
-                        int splitterDistance = (int)key.GetValue("SplitterDistance", 180);
-                        int maxWorkspaceWidth = Math.Min(MaxWorkspacePanelWidth, Math.Max(180, (int)(Width * 0.28)));
+                        int windowState = (int)key.GetValue("WindowState", 2);
+                        WindowState = (FormWindowState)Math.Clamp(windowState, 0, 2);
+
+                        int splitterDistance = (int)key.GetValue("SplitterDistance", 220);
+                        int maxWorkspaceWidth = Math.Min(MaxWorkspacePanelWidth, Math.Max(220, (int)(Width * 0.28)));
                         splitContainer1.SplitterDistance = Math.Min(splitterDistance, maxWorkspaceWidth);
 
-                        int editHistoryVisible = (int)key.GetValue("EditHistoryVisible", 0);
+                        int editHistoryVisible = (int)key.GetValue("EditHistoryVisible", 1);
                         _editHistoryPaneVisible = editHistoryVisible != 0;
                         if (_editHistoryMenuItem != null)
                             _editHistoryMenuItem.Checked = _editHistoryPaneVisible;
-                        if (_workspaceSplitContainer != null)
+                        int myNotesVisible = (int)key.GetValue("MyNotesVisible", 1);
+                        _myNotesPaneVisible = myNotesVisible != 0;
+                        if (_myNotesMenuItem != null)
+                            _myNotesMenuItem.Checked = _myNotesPaneVisible;
+                        int workspacePaneVisible = (int)key.GetValue("WorkspacePaneVisible", 1);
+                        _workspacePaneVisible = workspacePaneVisible != 0;
+                        if (_workspacePaneMenuItem != null)
+                            _workspacePaneMenuItem.Checked = _workspacePaneVisible;
+                        splitContainer1.Panel1Collapsed = !_workspacePaneVisible;
+                        if (_workspaceSplitContainer != null && _bottomSplitContainer != null)
                         {
-                            _workspaceSplitContainer.Panel2Collapsed = !_editHistoryPaneVisible;
-                            if (_editHistoryPaneVisible)
+                            _bottomSplitContainer.Panel1Collapsed = !_editHistoryPaneVisible;
+                            _bottomSplitContainer.Panel2Collapsed = !_myNotesPaneVisible;
+                            _workspaceSplitContainer.Panel2Collapsed = !_editHistoryPaneVisible && !_myNotesPaneVisible;
+                            if (_editHistoryPaneVisible || _myNotesPaneVisible)
                             {
                                 int h = _workspaceSplitContainer.Height - _workspaceSplitContainer.SplitterWidth;
                                 if (h > EditHistoryPaneHeight + 60)
@@ -4442,9 +5527,12 @@ namespace D2_Horadrim
                                     int wsSplit = (int)key.GetValue("WorkspaceSplitterDistance", h - EditHistoryPaneHeight);
                                     _workspaceSplitContainer.SplitterDistance = Math.Max(h - EditHistoryPaneHeight, Math.Min(wsSplit, h - 60));
                                 }
+                                int bottomSplit = (int)key.GetValue("BottomSplitterDistance", 0);
+                                if (bottomSplit > 0 && _editHistoryPaneVisible && _myNotesPaneVisible)
+                                    _bottomSplitContainer.SplitterDistance = Math.Max(80, Math.Min(bottomSplit, _bottomSplitContainer.Width - 80));
                             }
                         }
-                        int darkMode = (int)key.GetValue("DarkMode", 0);
+                        int darkMode = (int)key.GetValue("DarkMode", 1);
                         _darkMode = darkMode != 0;
                         if (_darkModeMenuItem != null)
                             _darkModeMenuItem.Checked = _darkMode;
@@ -4452,10 +5540,44 @@ namespace D2_Horadrim
                         _autoLoadPreviousSession = autoLoad != 0;
                         if (_autoLoadPreviousSessionMenuItem != null)
                             _autoLoadPreviousSessionMenuItem.Checked = _autoLoadPreviousSession;
+                        int preserveD2Compare = SettingsStorage.GetSetting("PreserveD2CompareWorkspaces", 0);
+                        _preserveD2CompareWorkspaces = preserveD2Compare != 0;
+                        if (_preserveD2CompareWorkspacesMenuItem != null)
+                            _preserveD2CompareWorkspacesMenuItem.Checked = _preserveD2CompareWorkspaces;
                         int headerTooltips = (int)key.GetValue("HeaderTooltipsFromDataGuide", 0);
                         _headerTooltipsFromDataGuide = headerTooltips != 0;
                         if (_headerTooltipsFromDataGuideMenuItem != null)
                             _headerTooltipsFromDataGuideMenuItem.Checked = _headerTooltipsFromDataGuide;
+                        int alwaysLockHeaderCol = (int)key.GetValue("AlwaysLockHeaderColumn", 0);
+                        _alwaysLockHeaderColumn = alwaysLockHeaderCol != 0;
+                        if (_alwaysLockHeaderColumnMenuItem != null)
+                            _alwaysLockHeaderColumnMenuItem.Checked = _alwaysLockHeaderColumn;
+                        int alwaysLockHeaderRow = (int)key.GetValue("AlwaysLockHeaderRow", 0);
+                        _alwaysLockHeaderRow = alwaysLockHeaderRow != 0;
+                        if (_alwaysLockHeaderRowMenuItem != null)
+                            _alwaysLockHeaderRowMenuItem.Checked = _alwaysLockHeaderRow;
+                        int groupedColumnWidth = (int)key.GetValue("GroupedColumnWidth", 0);
+                        if (_groupedColumnWidthMenuItem != null)
+                            _groupedColumnWidthMenuItem.Checked = groupedColumnWidth != 0;
+                        int groupedRowHeight = (int)key.GetValue("GroupedRowHeight", 0);
+                        if (_groupedRowHeightMenuItem != null)
+                            _groupedRowHeightMenuItem.Checked = groupedRowHeight != 0;
+                        try
+                        {
+                            string? colJson = key.GetValue("SavedColumnWidthsByFile") as string;
+                            if (!string.IsNullOrEmpty(colJson))
+                            {
+                                var deserialized = JsonSerializer.Deserialize<Dictionary<string, int[]>>(colJson);
+                                _savedColumnWidthsByFile = deserialized != null ? new Dictionary<string, int[]>(deserialized, StringComparer.OrdinalIgnoreCase) : new Dictionary<string, int[]>(StringComparer.OrdinalIgnoreCase);
+                            }
+                            string? rowJson = key.GetValue("SavedRowHeightsByFile") as string;
+                            if (!string.IsNullOrEmpty(rowJson))
+                            {
+                                var deserialized = JsonSerializer.Deserialize<Dictionary<string, int[]>>(rowJson);
+                                _savedRowHeightsByFile = deserialized != null ? new Dictionary<string, int[]>(deserialized, StringComparer.OrdinalIgnoreCase) : new Dictionary<string, int[]>(StringComparer.OrdinalIgnoreCase);
+                            }
+                        }
+                        catch { _savedColumnWidthsByFile = new Dictionary<string, int[]>(StringComparer.OrdinalIgnoreCase); _savedRowHeightsByFile = new Dictionary<string, int[]>(StringComparer.OrdinalIgnoreCase); }
                         int createBackup = (int)key.GetValue("CreateBackupOnSave", 0);
                         _createBackupOnSave = createBackup != 0;
                         int backupCount = (int)key.GetValue("BackupFileCount", 3);
@@ -4476,11 +5598,41 @@ namespace D2_Horadrim
                         else
                             _gridFont = null;
                     }
+                    else
+                    {
+                        // No registry: use same defaults as when value is present
+                        int maxWorkspaceWidth = Math.Min(MaxWorkspacePanelWidth, Math.Max(220, (int)(Width * 0.28)));
+                        splitContainer1.SplitterDistance = Math.Min(220, maxWorkspaceWidth);
+                        _editHistoryPaneVisible = true;
+                        _myNotesPaneVisible = true;
+                        if (_editHistoryMenuItem != null)
+                            _editHistoryMenuItem.Checked = true;
+                        if (_myNotesMenuItem != null)
+                            _myNotesMenuItem.Checked = true;
+                        _workspacePaneVisible = true;
+                        if (_workspacePaneMenuItem != null)
+                            _workspacePaneMenuItem.Checked = true;
+                        splitContainer1.Panel1Collapsed = false;
+                        if (_workspaceSplitContainer != null && _bottomSplitContainer != null)
+                        {
+                            _bottomSplitContainer.Panel1Collapsed = false;
+                            _bottomSplitContainer.Panel2Collapsed = false;
+                            _workspaceSplitContainer.Panel2Collapsed = false;
+                            if (_workspaceSplitContainer.Height > EditHistoryPaneHeight + 60)
+                            {
+                                int h = _workspaceSplitContainer.Height - _workspaceSplitContainer.SplitterWidth;
+                                _workspaceSplitContainer.SplitterDistance = Math.Min(h - EditHistoryPaneHeight, h - 60);
+                                if (_bottomSplitContainer.Width > 160)
+                                    _bottomSplitContainer.SplitterDistance = Math.Max(80, _bottomSplitContainer.Width / 2);
+                            }
+                        }
+                    }
                 }
             }
             catch { }
             ApplyTheme();
         }
+
 
         private void SaveWindowSettings()
         {
@@ -4492,11 +5644,45 @@ namespace D2_Horadrim
                     key.SetValue("WindowY", Location.Y);
                     key.SetValue("WindowWidth", Width);
                     key.SetValue("WindowHeight", Height);
+                    key.SetValue("WindowState", (int)WindowState);
                     key.SetValue("SplitterDistance", Math.Min(splitContainer1.SplitterDistance, MaxWorkspacePanelWidth));
                     key.SetValue("EditHistoryVisible", _editHistoryPaneVisible ? 1 : 0);
+                    key.SetValue("MyNotesVisible", _myNotesPaneVisible ? 1 : 0);
+                    key.SetValue("WorkspacePaneVisible", _workspacePaneVisible ? 1 : 0);
+                    if (_bottomSplitContainer != null)
+                        key.SetValue("BottomSplitterDistance", _bottomSplitContainer.SplitterDistance);
                     key.SetValue("DarkMode", _darkMode ? 1 : 0);
                     key.SetValue("AutoLoadPreviousSession", _autoLoadPreviousSession ? 1 : 0);
                     key.SetValue("HeaderTooltipsFromDataGuide", _headerTooltipsFromDataGuide ? 1 : 0);
+                    key.SetValue("AlwaysLockHeaderColumn", _alwaysLockHeaderColumn ? 1 : 0);
+                    key.SetValue("AlwaysLockHeaderRow", _alwaysLockHeaderRow ? 1 : 0);
+                    key.SetValue("GroupedColumnWidth", _groupedColumnWidthMenuItem?.Checked == true ? 1 : 0);
+                    key.SetValue("GroupedRowHeight", _groupedRowHeightMenuItem?.Checked == true ? 1 : 0);
+                    try
+                    {
+                        var colDict = new Dictionary<string, int[]>(StringComparer.OrdinalIgnoreCase);
+                        var rowDict = new Dictionary<string, int[]>(StringComparer.OrdinalIgnoreCase);
+                        foreach (TabPage tab in tabControl.TabPages)
+                        {
+                            string? filePath = (tab.Tag as TabTag)?.FilePath;
+                            if (string.IsNullOrEmpty(filePath)) continue;
+                            var dgv = GetGridForTab(tab);
+                            if (dgv == null) continue;
+                            string pathNorm = NormalizeFilePath(filePath);
+                            if (string.IsNullOrEmpty(pathNorm)) continue;
+                            var widths = new int[dgv.Columns.Count];
+                            for (int i = 0; i < dgv.Columns.Count; i++)
+                                widths[i] = dgv.Columns[i].Width;
+                            colDict[pathNorm] = widths;
+                            var heights = new int[dgv.Rows.Count];
+                            for (int i = 0; i < dgv.Rows.Count; i++)
+                                heights[i] = dgv.Rows[i].IsNewRow ? 0 : dgv.Rows[i].Height;
+                            rowDict[pathNorm] = heights;
+                        }
+                        key.SetValue("SavedColumnWidthsByFile", JsonSerializer.Serialize(colDict));
+                        key.SetValue("SavedRowHeightsByFile", JsonSerializer.Serialize(rowDict));
+                    }
+                    catch { }
                     key.SetValue("CreateBackupOnSave", _createBackupOnSave ? 1 : 0);
                     key.SetValue("BackupFileCount", Math.Max(1, Math.Min(20, _backupFileCount)));
                     if (_gridFont != null)
@@ -4514,6 +5700,9 @@ namespace D2_Horadrim
                     if (_workspaceSplitContainer != null)
                         key.SetValue("WorkspaceSplitterDistance", _workspaceSplitContainer.SplitterDistance);
                 }
+
+                // Persist cross-platform settings via SettingsStorage as well.
+                SettingsStorage.SetSetting("PreserveD2CompareWorkspaces", _preserveD2CompareWorkspaces ? 1 : 0);
             }
             catch { }
         }
@@ -4521,6 +5710,39 @@ namespace D2_Horadrim
         private void HeaderTooltipsFromDataGuideMenuItem_Click(object? sender, EventArgs e)
         {
             _headerTooltipsFromDataGuide = _headerTooltipsFromDataGuideMenuItem?.Checked ?? false;
+        }
+
+        private void AlwaysLockHeaderColumnMenuItem_Click(object? sender, EventArgs e)
+        {
+            _alwaysLockHeaderColumn = _alwaysLockHeaderColumnMenuItem?.Checked ?? false;
+            SaveWindowSettings();
+            if (dataGridView == null) return;
+            int firstDataCol = GetFirstDataColumnIndex(dataGridView);
+            if (firstDataCol < 0) return;
+            if (_alwaysLockHeaderColumn)
+                lockedColumns.Add(firstDataCol);
+            else
+                lockedColumns.Remove(firstDataCol);
+            ApplyFrozenColumns();
+            ApplyRowStyles();
+            ApplyHeaderCellColors(dataGridView);
+            RefreshColumnHeaders();
+            dataGridView.Invalidate();
+        }
+
+        private void AlwaysLockHeaderRowMenuItem_Click(object? sender, EventArgs e)
+        {
+            _alwaysLockHeaderRow = _alwaysLockHeaderRowMenuItem?.Checked ?? false;
+            SaveWindowSettings();
+            if (dataGridView == null) return;
+            if (_alwaysLockHeaderRow)
+                lockedRows.Add(0);
+            else
+                lockedRows.Remove(0);
+            ApplyFrozenRows();
+            ApplyHeaderCellColors(dataGridView);
+            RefreshColumnHeaders();
+            dataGridView.Invalidate();
         }
 
         private void ConfigurationMenuItem_Click(object? sender, EventArgs e)
@@ -4544,15 +5766,21 @@ namespace D2_Horadrim
             }
         }
 
-        /// <summary>Legend for [x] markers shown in column tooltips. Shown via Help → Column markers.</summary>
-        public static readonly string ColumnMarkersLegend =
-            "Column Markers (what [x] next to column names means):\r\n\r\n" +
-            "[ * ] = Comment column. Not read by the game; used for documentation or indexing only.\r\n\r\n" +
-            "[B] = Boolean column. Only values 0 and 1 (On/Off, Disabled/Enabled).\r\n\r\n" +
-            "[N] = Number column. Static numbers only; e.g. skill parameter or item stat value.\r\n\r\n" +
-            "[O] = Open column. Text, numbers, and limited special characters; often references to other file entries. No calculations.\r\n\r\n" +
-            "[C] = Calculation column. Math arithmetic for dynamic values (e.g. SkillCalc.txt). Static numbers also allowed.\r\n\r\n" +
-            "[X] = Broken column. Broken or highly restrictive.";
+        // Shown via Help → Hotkeys.
+        private static readonly string HotkeysLegend =
+            "Row/Column must be selected:\r\n" +
+            "Alt + F = Freeze/Unfreeze Row(s) or Column(s)\r\n" +
+            "Alt + A = Add row or column\r\n" +
+            "Alt + I = Insert row or column\r\n" +
+            "Alt + R = Remove row or column\r\n" +
+            "Alt + C = Clone row or column\r\n" +
+            "Alt + H = Hide row or column\r\n" +
+            "Alt + U = Unhide row or column\r\n\r\n" +
+            "No selection needed:\r\n" +
+            "Alt + E = Edit History pane toggle\r\n" +
+            "Alt + N = Notes pane toggle\r\n" +
+            "Alt + W = Workspace pane toggle\r\n" +
+            "Alt + D = Dataguide Tooltips toggle";
 
         private static Dictionary<string, Dictionary<string, string>> BuildManualHeaderTooltips()
         {
@@ -6432,7 +7660,6 @@ namespace D2_Horadrim
 
             wanderingmon["class"] = "Open - Uses a monster \"ID\" defined from the monstats.txt file. Monsters defined here are added to a list which is used to randomly pick a monster to spawn in an area level.";
 
-
             result["ActInfo.txt"] = actinfo;
             result["Armor.txt"] = armor;
             result["Misc.txt"] = misc;
@@ -6734,6 +7961,23 @@ namespace D2_Horadrim
             catch { }
         }
 
+        private void RemoveD2CompareWorkspaces()
+        {
+            try
+            {
+                var nodesToRemove = new List<TreeNode>();
+                foreach (TreeNode node in treeView.Nodes)
+                {
+                    if (node.Text.StartsWith("D2Compare (", StringComparison.OrdinalIgnoreCase))
+                        nodesToRemove.Add(node);
+                }
+
+                foreach (var node in nodesToRemove)
+                    treeView.Nodes.Remove(node);
+            }
+            catch { }
+        }
+
         private void LoadTextColors()
         {
             try
@@ -6744,6 +7988,7 @@ namespace D2_Horadrim
                     if (key.GetValue("TextColorTabArgb") is int v) _textColorTab = Color.FromArgb(v);
                     if (key.GetValue("TextColorHeaderArgb") is int v2) _textColorHeader = Color.FromArgb(v2);
                     if (key.GetValue("TextColorCellArgb") is int v3) _textColorCell = Color.FromArgb(v3);
+                    if (key.GetValue("TextColorCellFrozenArgb") is int v3f) _textColorCellFrozen = Color.FromArgb(v3f);
                     if (key.GetValue("TextColorWorkspaceArgb") is int v4) _textColorWorkspace = Color.FromArgb(v4);
                     if (key.GetValue("TextColorEditHistoryArgb") is int v5) _textColorEditHistory = Color.FromArgb(v5);
                     if (key.GetValue("TextColorWorkspaceEntryArgb") is int ve) _textColorWorkspaceEntry = Color.FromArgb(ve);
@@ -6754,6 +7999,7 @@ namespace D2_Horadrim
                     if (key.GetValue("TextColorTabDarkArgb") is int d1) _textColorTabDark = Color.FromArgb(d1);
                     if (key.GetValue("TextColorHeaderDarkArgb") is int d2) _textColorHeaderDark = Color.FromArgb(d2);
                     if (key.GetValue("TextColorCellDarkArgb") is int d3) _textColorCellDark = Color.FromArgb(d3);
+                    if (key.GetValue("TextColorCellFrozenDarkArgb") is int d3f) _textColorCellFrozenDark = Color.FromArgb(d3f);
                     if (key.GetValue("TextColorWorkspaceDarkArgb") is int d4) _textColorWorkspaceDark = Color.FromArgb(d4);
                     if (key.GetValue("TextColorEditHistoryDarkArgb") is int d5) _textColorEditHistoryDark = Color.FromArgb(d5);
                     if (key.GetValue("TextColorWorkspaceEntryDarkArgb") is int de) _textColorWorkspaceEntryDark = Color.FromArgb(de);
@@ -6775,6 +8021,7 @@ namespace D2_Horadrim
                     key.SetValue("TextColorTabArgb", _textColorTab.ToArgb());
                     key.SetValue("TextColorHeaderArgb", _textColorHeader.ToArgb());
                     key.SetValue("TextColorCellArgb", _textColorCell.ToArgb());
+                    key.SetValue("TextColorCellFrozenArgb", _textColorCellFrozen.ToArgb());
                     key.SetValue("TextColorWorkspaceArgb", _textColorWorkspace.ToArgb());
                     key.SetValue("TextColorEditHistoryArgb", _textColorEditHistory.ToArgb());
                     key.SetValue("TextColorWorkspaceEntryArgb", _textColorWorkspaceEntry.ToArgb());
@@ -6785,6 +8032,7 @@ namespace D2_Horadrim
                     key.SetValue("TextColorTabDarkArgb", _textColorTabDark.ToArgb());
                     key.SetValue("TextColorHeaderDarkArgb", _textColorHeaderDark.ToArgb());
                     key.SetValue("TextColorCellDarkArgb", _textColorCellDark.ToArgb());
+                    key.SetValue("TextColorCellFrozenDarkArgb", _textColorCellFrozenDark.ToArgb());
                     key.SetValue("TextColorWorkspaceDarkArgb", _textColorWorkspaceDark.ToArgb());
                     key.SetValue("TextColorEditHistoryDarkArgb", _textColorEditHistoryDark.ToArgb());
                     key.SetValue("TextColorWorkspaceEntryDarkArgb", _textColorWorkspaceEntryDark.ToArgb());
@@ -6799,14 +8047,13 @@ namespace D2_Horadrim
 
         private void TextColorControlsMenuItem_Click(object? sender, EventArgs e)
         {
-            using (var form = new TextColorControlsForm(
-                _textColorTab, _textColorHeader, _textColorCell, _textColorWorkspaceEntry, _textColorWorkspaceFiles, _textColorEditHistory, _textColorMenuStandby, _textColorMenuActive, _textColorButtons,
-                _textColorTabDark, _textColorHeaderDark, _textColorCellDark, _textColorWorkspaceEntryDark, _textColorWorkspaceFilesDark, _textColorEditHistoryDark, _textColorMenuStandbyDark, _textColorMenuActiveDark, _textColorButtonsDark))
+            using (var form = new TextColorControlsForm(_textColorTab, _textColorHeader, _textColorCell, _textColorCellFrozen, _textColorWorkspaceEntry, _textColorWorkspaceFiles, _textColorEditHistory, _textColorMenuStandby, _textColorMenuActive, _textColorButtons, _textColorTabDark, _textColorHeaderDark, _textColorCellDark, _textColorCellFrozenDark, _textColorWorkspaceEntryDark, _textColorWorkspaceFilesDark, _textColorEditHistoryDark, _textColorMenuStandbyDark, _textColorMenuActiveDark, _textColorButtonsDark))
             {
                 if (form.ShowDialog(this) != DialogResult.OK) return;
                 _textColorTab = form.TabTextColor;
                 _textColorHeader = form.HeaderTextColor;
                 _textColorCell = form.CellTextColor;
+                _textColorCellFrozen = form.CellFrozenTextColor;
                 _textColorWorkspaceEntry = form.WorkspaceEntryTextColor;
                 _textColorWorkspaceFiles = form.WorkspaceFilesTextColor;
                 _textColorEditHistory = form.EditHistoryTextColor;
@@ -6816,6 +8063,7 @@ namespace D2_Horadrim
                 _textColorTabDark = form.TabTextColorDark;
                 _textColorHeaderDark = form.HeaderTextColorDark;
                 _textColorCellDark = form.CellTextColorDark;
+                _textColorCellFrozenDark = form.CellFrozenTextColorDark;
                 _textColorWorkspaceEntryDark = form.WorkspaceEntryTextColorDark;
                 _textColorWorkspaceFilesDark = form.WorkspaceFilesTextColorDark;
                 _textColorEditHistoryDark = form.EditHistoryTextColorDark;
@@ -7350,6 +8598,7 @@ namespace D2_Horadrim
         public Color TabTextColor { get; private set; }
         public Color HeaderTextColor { get; private set; }
         public Color CellTextColor { get; private set; }
+        public Color CellFrozenTextColor { get; private set; }
         public Color WorkspaceEntryTextColor { get; private set; }
         public Color WorkspaceFilesTextColor { get; private set; }
         public Color EditHistoryTextColor { get; private set; }
@@ -7358,6 +8607,7 @@ namespace D2_Horadrim
         public Color TabTextColorDark { get; private set; }
         public Color HeaderTextColorDark { get; private set; }
         public Color CellTextColorDark { get; private set; }
+        public Color CellFrozenTextColorDark { get; private set; }
         public Color WorkspaceEntryTextColorDark { get; private set; }
         public Color WorkspaceFilesTextColorDark { get; private set; }
         public Color EditHistoryTextColorDark { get; private set; }
@@ -7366,13 +8616,12 @@ namespace D2_Horadrim
         public Color ButtonTextColor { get; private set; }
         public Color ButtonTextColorDark { get; private set; }
 
-        public TextColorControlsForm(
-            Color tabText, Color headerText, Color cellText, Color workspaceEntryText, Color workspaceFilesText, Color editHistoryText, Color menuStandbyText, Color menuActiveText, Color buttonText,
-            Color tabTextDark, Color headerTextDark, Color cellTextDark, Color workspaceEntryTextDark, Color workspaceFilesTextDark, Color editHistoryTextDark, Color menuStandbyTextDark, Color menuActiveTextDark, Color buttonTextDark)
+        public TextColorControlsForm(Color tabText, Color headerText, Color cellText, Color cellFrozenText, Color workspaceEntryText, Color workspaceFilesText, Color editHistoryText, Color menuStandbyText, Color menuActiveText, Color buttonText, Color tabTextDark, Color headerTextDark, Color cellTextDark, Color cellFrozenTextDark, Color workspaceEntryTextDark, Color workspaceFilesTextDark, Color editHistoryTextDark, Color menuStandbyTextDark, Color menuActiveTextDark, Color buttonTextDark)
         {
             TabTextColor = tabText;
             HeaderTextColor = headerText;
             CellTextColor = cellText;
+            CellFrozenTextColor = cellFrozenText;
             WorkspaceEntryTextColor = workspaceEntryText;
             WorkspaceFilesTextColor = workspaceFilesText;
             EditHistoryTextColor = editHistoryText;
@@ -7382,6 +8631,7 @@ namespace D2_Horadrim
             TabTextColorDark = tabTextDark;
             HeaderTextColorDark = headerTextDark;
             CellTextColorDark = cellTextDark;
+            CellFrozenTextColorDark = cellFrozenTextDark;
             WorkspaceEntryTextColorDark = workspaceEntryTextDark;
             WorkspaceFilesTextColorDark = workspaceFilesTextDark;
             EditHistoryTextColorDark = editHistoryTextDark;
@@ -7405,15 +8655,19 @@ namespace D2_Horadrim
                 Dock = DockStyle.Top,
                 Padding = new Padding(0),
                 ColumnCount = 2,
-                RowCount = 21,
-                Height = 2 * sectionHeaderHeight + 18 * rowHeight + 50
+                RowCount = 23,
+                Height = 2 * sectionHeaderHeight + 20 * rowHeight + 50
             };
             table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55));
             table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45));
             table.RowStyles.Add(new RowStyle(SizeType.Absolute, sectionHeaderHeight));
-            for (int r = 1; r <= 9; r++) table.RowStyles.Add(new RowStyle(SizeType.Absolute, rowHeight));
+            for (int r = 1; r <= 3; r++) table.RowStyles.Add(new RowStyle(SizeType.Absolute, rowHeight));
+            table.RowStyles.Add(new RowStyle(SizeType.Absolute, rowHeight)); // Cell (frozen)
+            for (int r = 5; r <= 10; r++) table.RowStyles.Add(new RowStyle(SizeType.Absolute, rowHeight));
             table.RowStyles.Add(new RowStyle(SizeType.Absolute, sectionHeaderHeight));
-            for (int r = 11; r <= 19; r++) table.RowStyles.Add(new RowStyle(SizeType.Absolute, rowHeight));
+            for (int r = 12; r <= 14; r++) table.RowStyles.Add(new RowStyle(SizeType.Absolute, rowHeight));
+            table.RowStyles.Add(new RowStyle(SizeType.Absolute, rowHeight)); // Cell (frozen) dark
+            for (int r = 16; r <= 21; r++) table.RowStyles.Add(new RowStyle(SizeType.Absolute, rowHeight));
             table.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
 
             var lightLabel = new Label
@@ -7429,12 +8683,13 @@ namespace D2_Horadrim
             AddColorRow(table, 1, "Tab Text", tabText, c => TabTextColor = c);
             AddColorRow(table, 2, "Header Text", headerText, c => HeaderTextColor = c);
             AddColorRow(table, 3, "Cell Text", cellText, c => CellTextColor = c);
-            AddColorRow(table, 4, "Workspace Entry Text", workspaceEntryText, c => WorkspaceEntryTextColor = c);
-            AddColorRow(table, 5, "Workspace Files Text", workspaceFilesText, c => WorkspaceFilesTextColor = c);
-            AddColorRow(table, 6, "Edit History Text", editHistoryText, c => EditHistoryTextColor = c);
-            AddColorRow(table, 7, "Menu Standby Text", menuStandbyText, c => MenuStandbyTextColor = c);
-            AddColorRow(table, 8, "Menu Active Text", menuActiveText, c => MenuActiveTextColor = c);
-            AddColorRow(table, 9, "Button Text", buttonText, c => ButtonTextColor = c);
+            AddColorRow(table, 4, "Cell (frozen)", cellFrozenText, c => CellFrozenTextColor = c);
+            AddColorRow(table, 5, "Workspace Entry Text", workspaceEntryText, c => WorkspaceEntryTextColor = c);
+            AddColorRow(table, 6, "Workspace Files Text", workspaceFilesText, c => WorkspaceFilesTextColor = c);
+            AddColorRow(table, 7, "Edit History Text", editHistoryText, c => EditHistoryTextColor = c);
+            AddColorRow(table, 8, "Menu Standby Text", menuStandbyText, c => MenuStandbyTextColor = c);
+            AddColorRow(table, 9, "Menu Active Text", menuActiveText, c => MenuActiveTextColor = c);
+            AddColorRow(table, 10, "Button Text", buttonText, c => ButtonTextColor = c);
 
             var darkLabel = new Label
             {
@@ -7443,18 +8698,19 @@ namespace D2_Horadrim
                 Anchor = AnchorStyles.Left,
                 ForeColor = Color.DarkSlateGray
             };
-            table.Controls.Add(darkLabel, 0, 10);
+            table.Controls.Add(darkLabel, 0, 11);
             table.SetColumnSpan(darkLabel, 2);
 
-            AddColorRow(table, 11, "Tab Text", tabTextDark, c => TabTextColorDark = c);
-            AddColorRow(table, 12, "Header Text", headerTextDark, c => HeaderTextColorDark = c);
-            AddColorRow(table, 13, "Cell Text", cellTextDark, c => CellTextColorDark = c);
-            AddColorRow(table, 14, "Workspace Entry Text", workspaceEntryTextDark, c => WorkspaceEntryTextColorDark = c);
-            AddColorRow(table, 15, "Workspace Files Text", workspaceFilesTextDark, c => WorkspaceFilesTextColorDark = c);
-            AddColorRow(table, 16, "Edit History Text", editHistoryTextDark, c => EditHistoryTextColorDark = c);
-            AddColorRow(table, 17, "Menu Standby Text", menuStandbyTextDark, c => MenuStandbyTextColorDark = c);
-            AddColorRow(table, 18, "Menu Active Text", menuActiveTextDark, c => MenuActiveTextColorDark = c);
-            AddColorRow(table, 19, "Button Text", buttonTextDark, c => ButtonTextColorDark = c);
+            AddColorRow(table, 12, "Tab Text", tabTextDark, c => TabTextColorDark = c);
+            AddColorRow(table, 13, "Header Text", headerTextDark, c => HeaderTextColorDark = c);
+            AddColorRow(table, 14, "Cell Text", cellTextDark, c => CellTextColorDark = c);
+            AddColorRow(table, 15, "Cell (frozen)", cellFrozenTextDark, c => CellFrozenTextColorDark = c);
+            AddColorRow(table, 16, "Workspace Entry Text", workspaceEntryTextDark, c => WorkspaceEntryTextColorDark = c);
+            AddColorRow(table, 17, "Workspace Files Text", workspaceFilesTextDark, c => WorkspaceFilesTextColorDark = c);
+            AddColorRow(table, 18, "Edit History Text", editHistoryTextDark, c => EditHistoryTextColorDark = c);
+            AddColorRow(table, 19, "Menu Standby Text", menuStandbyTextDark, c => MenuStandbyTextColorDark = c);
+            AddColorRow(table, 20, "Menu Active Text", menuActiveTextDark, c => MenuActiveTextColorDark = c);
+            AddColorRow(table, 21, "Button Text", buttonTextDark, c => ButtonTextColorDark = c);
 
             var cancelBtn = new Button { Text = "Cancel", Size = new Size(85, 30) };
             cancelBtn.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };

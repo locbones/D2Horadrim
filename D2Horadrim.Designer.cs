@@ -2,15 +2,10 @@ namespace D2_Horadrim
 {
     partial class D2Horadrim
     {
-        /// <summary>
-        ///  Required designer variable.
-        /// </summary>
+        // Required designer variable.
         private System.ComponentModel.IContainer components = null;
 
-        /// <summary>
-        ///  Clean up any resources being used.
-        /// </summary>
-        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        // Clean up any resources being used. disposing: true if managed resources should be disposed; otherwise, false.
         protected override void Dispose(bool disposing)
         {
             if (disposing && (components != null))
@@ -22,10 +17,7 @@ namespace D2_Horadrim
 
         #region Windows Form Designer generated code
 
-        /// <summary>
-        ///  Required method for Designer support - do not modify
-        ///  the contents of this method with the code editor.
-        /// </summary>
+        // Required method for Designer support - do not modify the contents of this method with the code editor.
         private void InitializeComponent()
         {
             components = new System.ComponentModel.Container();
@@ -55,7 +47,6 @@ namespace D2_Horadrim
             saveToolStripMenuItem = new ToolStripMenuItem();
             toolStripSeparator2 = new ToolStripSeparator();
             exitToolStripMenuItem = new ToolStripMenuItem();
-            editToolStripMenuItem = new ToolStripMenuItem();
             copyToolStripMenuItem = new ToolStripMenuItem();
             pasteToolStripMenuItem = new ToolStripMenuItem();
             viewToolStripMenuItem = new ToolStripMenuItem();
@@ -161,7 +152,7 @@ namespace D2_Horadrim
             // 
             // menuStrip1
             // 
-            menuStrip1.Items.AddRange(new ToolStripItem[] { fileToolStripMenuItem, editToolStripMenuItem, viewToolStripMenuItem, settingsToolStripMenuItem });
+            menuStrip1.Items.AddRange(new ToolStripItem[] { fileToolStripMenuItem, viewToolStripMenuItem, settingsToolStripMenuItem });
             menuStrip1.Location = new Point(0, 0);
             menuStrip1.Name = "menuStrip1";
             menuStrip1.Size = new Size(800, 24);
@@ -210,29 +201,8 @@ namespace D2_Horadrim
             // 
             exitToolStripMenuItem.Name = "exitToolStripMenuItem";
             exitToolStripMenuItem.Size = new Size(180, 22);
-            exitToolStripMenuItem.Text = "E&xit";
+            exitToolStripMenuItem.Text = "&Exit";
             exitToolStripMenuItem.Click += ExitToolStripMenuItem_Click;
-            // 
-            // editToolStripMenuItem
-            // 
-            editToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { copyToolStripMenuItem, pasteToolStripMenuItem });
-            editToolStripMenuItem.Name = "editToolStripMenuItem";
-            editToolStripMenuItem.Size = new Size(39, 20);
-            editToolStripMenuItem.Text = "&Edit";
-            // 
-            // copyToolStripMenuItem
-            // 
-            copyToolStripMenuItem.Name = "copyToolStripMenuItem";
-            copyToolStripMenuItem.Size = new Size(122, 22);
-            copyToolStripMenuItem.Text = "&Copy";
-            copyToolStripMenuItem.Click += CopyToolStripMenuItem_Click;
-            // 
-            // pasteToolStripMenuItem
-            // 
-            pasteToolStripMenuItem.Name = "pasteToolStripMenuItem";
-            pasteToolStripMenuItem.Size = new Size(122, 22);
-            pasteToolStripMenuItem.Text = "&Paste";
-            pasteToolStripMenuItem.Click += PasteToolStripMenuItem_Click;
             // 
             // viewToolStripMenuItem
             // 
@@ -276,7 +246,7 @@ namespace D2_Horadrim
             Controls.Add(menuStrip1);
             MainMenuStrip = menuStrip1;
             Name = "D2Horadrim";
-            Text = "D2_Horadrim";
+            Text = "D2 Horadrim";
             FormClosing += Form1_FormClosing;
             FormClosed += Form1_FormClosed;
             Load += Form1_Load;

@@ -6,10 +6,11 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
-    <Version>1.0.0</Version>
+    <Version>1.0.2</Version>
     <Product>D2_Horadrim</Product>
     <RootNamespace>D2_Horadrim</RootNamespace>
     <AssemblyTitle>D2_Horadrim</AssemblyTitle>
+    <ApplicationIcon>D2Horadrim.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
