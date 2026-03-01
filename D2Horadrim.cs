@@ -176,49 +176,6 @@ namespace D2_Horadrim
         private const int WM_SYSKEYUP = 0x0105;
         private const int VK_MENU = 0x12;
 
-        private const int WH_KEYBOARD_LL = 13;
-        private const int WM_KEYDOWN = 0x0100;
-        private const int WM_KEYUP = 0x0101;
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct KBDLLHOOKSTRUCT
-        {
-            public uint vkCode;
-            public uint scanCode;
-            public uint flags;
-            public uint time;
-            public IntPtr dwExtraInfo;
-        }
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetForegroundWindow();
-
-        [DllImport("user32.dll")]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-        private const uint WM_APP = 0x8000;
-        private const uint WM_HOTKEY_ALT = WM_APP + 1;
-
-        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
-
-        private IntPtr _lowLevelHookHandle = IntPtr.Zero;
-        private LowLevelKeyboardProc? _lowLevelHookProc; // keep alive for GC
-        private bool _altKeyLogicalDown; // set when we consume Alt key down so Alt+Click works
-
         private enum MathOp { Add, Subtract, Divide, Multiply, RoundUp, RoundDown, CustomFormula, IncrementFill }
 
         private const string RegistryKeyPath = @"Software\D2_Horadrim";
@@ -380,6 +337,8 @@ namespace D2_Horadrim
         public D2Horadrim()
         {
             InitializeComponent();
+
+            saveToolStripMenuItem.ShortcutKeys = Keys.Control | Keys.S;
 
             treeView = new TreeView();
             treeView.HideSelection = false; // keep selection visible even when TreeView loses focus
@@ -1760,82 +1719,6 @@ namespace D2_Horadrim
             return false;
         }
 
-        private IntPtr LowLevelKeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
-        {
-            if (nCode < 0)
-                return CallNextHookEx(_lowLevelHookHandle, nCode, wParam, lParam);
-
-            IntPtr fg = GetForegroundWindow();
-            if (fg == IntPtr.Zero || GetWindowThreadProcessId(fg, out uint pid) == 0 || pid != System.Diagnostics.Process.GetCurrentProcess().Id)
-                return CallNextHookEx(_lowLevelHookHandle, nCode, wParam, lParam);
-
-            var kbd = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-            int wp = wParam.ToInt32();
-
-            if (wp == WM_SYSKEYDOWN)
-            {
-                if (kbd.vkCode == VK_MENU)
-                    _altKeyLogicalDown = true;
-                else
-                    PostMessage(Handle, WM_HOTKEY_ALT, (IntPtr)kbd.vkCode, IntPtr.Zero);
-                return (IntPtr)1;
-            }
-            if (wp == WM_SYSKEYUP)
-            {
-                if (kbd.vkCode == VK_MENU)
-                    _altKeyLogicalDown = false;
-                return (IntPtr)1;
-            }
-            if ((wp == WM_KEYDOWN || wp == WM_KEYUP) && kbd.vkCode == VK_MENU)
-            {
-                if (wp == WM_KEYDOWN)
-                    _altKeyLogicalDown = true;
-                else
-                    _altKeyLogicalDown = false;
-                return (IntPtr)1;
-            }
-
-            return CallNextHookEx(_lowLevelHookHandle, nCode, wParam, lParam);
-        }
-
-        protected override void WndProc(ref Message m)
-        {
-            if (m.Msg == (int)WM_HOTKEY_ALT)
-            {
-                HandleAltHotkey(m.WParam.ToInt32());
-                m.Result = IntPtr.Zero;
-                return;
-            }
-            base.WndProc(ref m);
-        }
-
-        private static readonly int VK_A = 0x41, VK_C = 0x43, VK_D = 0x44, VK_E = 0x45, VK_F = 0x46, VK_H = 0x48, VK_I = 0x49, VK_N = 0x4E, VK_R = 0x52, VK_U = 0x55, VK_W = 0x57;
-
-        private void HandleAltHotkey(int vkCode)
-        {
-            // Global toggles (work anywhere)
-            if (vkCode == VK_E) { ToggleEditHistoryPane(); return; }
-            if (vkCode == VK_N) { ToggleNotesPane(); return; }
-            if (vkCode == VK_W) { ToggleWorkspacePane(); return; }
-            if (vkCode == VK_D) { ToggleHeaderTooltips(); return; }
-
-            // Row/column operations (require grid with selection)
-            var dgv = GetCurrentGrid();
-            if (dgv == null) return;
-            bool columnOp = PreferColumnOperation(dgv);
-
-            if (vkCode == VK_F)
-            {
-                ToggleFreezeSelectedColumnsOrRows(dgv, columnOp);
-                return;
-            }
-            if (vkCode == VK_A) { if (columnOp) ColumnOptions_Add(); else RowOptions_Add(); return; }
-            if (vkCode == VK_I) { if (columnOp) ColumnOptions_Insert(); else RowOptions_Insert(); return; }
-            if (vkCode == VK_R) { if (columnOp) ColumnOptions_Remove(); else RowOptions_Remove(); return; }
-            if (vkCode == VK_C) { if (columnOp) ColumnOptions_Clone(); else RowOptions_Clone(); return; }
-            if (vkCode == VK_H) { if (columnOp) ColumnOptions_Hide(); else RowOptions_Hide(); return; }
-            if (vkCode == VK_U) { if (columnOp) ColumnOptions_Unhide(); else RowOptions_Unhide(); return; }
-        }
 
         private bool PreferColumnOperation(DataGridView dgv)
         {
@@ -1983,23 +1866,31 @@ namespace D2_Horadrim
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
+            // Global Alt+key toggles
+            if (keyData == (Keys.Alt | Keys.E)) { ToggleEditHistoryPane(); return true; }
+            if (keyData == (Keys.Alt | Keys.N)) { ToggleNotesPane(); return true; }
+            if (keyData == (Keys.Alt | Keys.W)) { ToggleWorkspacePane(); return true; }
+            if (keyData == (Keys.Alt | Keys.D)) { ToggleHeaderTooltips(); return true; }
+
+            // Grid Alt+key operations
+            var dgv = GetCurrentGrid();
+            if (dgv != null)
+            {
+                bool columnOp = PreferColumnOperation(dgv);
+                if (keyData == (Keys.Alt | Keys.F)) { ToggleFreezeSelectedColumnsOrRows(dgv, columnOp); return true; }
+                if (keyData == (Keys.Alt | Keys.A)) { if (columnOp) ColumnOptions_Add(); else RowOptions_Add(); return true; }
+                if (keyData == (Keys.Alt | Keys.I)) { if (columnOp) ColumnOptions_Insert(); else RowOptions_Insert(); return true; }
+                if (keyData == (Keys.Alt | Keys.R)) { if (columnOp) ColumnOptions_Remove(); else RowOptions_Remove(); return true; }
+                if (keyData == (Keys.Alt | Keys.C)) { if (columnOp) ColumnOptions_Clone(); else RowOptions_Clone(); return true; }
+                if (keyData == (Keys.Alt | Keys.H)) { if (columnOp) ColumnOptions_Hide(); else RowOptions_Hide(); return true; }
+                if (keyData == (Keys.Alt | Keys.U)) { if (columnOp) ColumnOptions_Unhide(); else RowOptions_Unhide(); return true; }
+            }
+
             if (dataGridView?.Focused == true)
             {
-                if (keyData == (Keys.Control | Keys.C))
-                {
-                    CopySelectedCellsToClipboard();
-                    return true;
-                }
-                if (keyData == (Keys.Control | Keys.V))
-                {
-                    PasteFromClipboard();
-                    return true;
-                }
-                if (keyData == (Keys.Control | Keys.Z))
-                {
-                    PerformUndo();
-                    return true;
-                }
+                if (keyData == (Keys.Control | Keys.C)) { CopySelectedCellsToClipboard(); return true; }
+                if (keyData == (Keys.Control | Keys.V)) { PasteFromClipboard(); return true; }
+                if (keyData == (Keys.Control | Keys.Z)) { PerformUndo(); return true; }
             }
             return base.ProcessCmdKey(ref msg, keyData);
         }
@@ -2511,7 +2402,7 @@ namespace D2_Horadrim
             int columnIndex = e.ColumnIndex;
             dgv.Columns[columnIndex].SortMode = DataGridViewColumnSortMode.NotSortable;
 
-            if (_altKeyLogicalDown || (Control.ModifierKeys & Keys.Alt) == Keys.Alt)
+            if ((Control.ModifierKeys & Keys.Alt) == Keys.Alt)
             {
                 if (lockedColumns.Contains(columnIndex))
                     lockedColumns.Remove(columnIndex);
@@ -2574,7 +2465,7 @@ namespace D2_Horadrim
             int rowIndex = e.RowIndex;
             if (dgv.Rows[rowIndex].IsNewRow) return;
 
-            if (_altKeyLogicalDown || (Control.ModifierKeys & Keys.Alt) == Keys.Alt)
+            if ((Control.ModifierKeys & Keys.Alt) == Keys.Alt)
             {
                 if (lockedRows.Contains(rowIndex))
                     lockedRows.Remove(rowIndex);
@@ -5358,8 +5249,6 @@ namespace D2_Horadrim
         private void Form1_Load(object sender, EventArgs e)
         {
             Application.AddMessageFilter(this);
-            _lowLevelHookProc = LowLevelKeyboardHookCallback;
-            _lowLevelHookHandle = SetWindowsHookEx(WH_KEYBOARD_LL, _lowLevelHookProc, IntPtr.Zero, 0);
             try
             {
                 var exeIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
@@ -5468,11 +5357,6 @@ namespace D2_Horadrim
 
         private void Form1_FormClosed(object sender, FormClosedEventArgs e)
         {
-            if (_lowLevelHookHandle != IntPtr.Zero)
-            {
-                UnhookWindowsHookEx(_lowLevelHookHandle);
-                _lowLevelHookHandle = IntPtr.Zero;
-            }
             Application.RemoveMessageFilter(this);
             SaveWindowSettings();
         }
